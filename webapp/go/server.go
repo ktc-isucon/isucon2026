@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"os"
 
 	"github.com/jmoiron/sqlx"
@@ -14,6 +15,8 @@ type HandlerContext struct {
 	DB     *sqlx.DB
 	Config *Config
 	IPBans *IPBanList
+
+	Notifications *notificationWatcher
 }
 
 func NewServer(config *Config) *echo.Echo {
@@ -41,7 +44,10 @@ func NewServer(config *Config) *echo.Echo {
 		DB:     db,
 		Config: config,
 		IPBans: &IPBanList{},
+
+		Notifications: newNotificationWatcher(db),
 	}
+	go handlerContext.Notifications.run(context.Background())
 	e.Use(IPBanMiddleware(handlerContext))
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
