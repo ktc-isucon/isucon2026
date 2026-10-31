@@ -68,15 +68,14 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		startsAt := opened.StartsAt
 		// 終了させたUPDATEと同じ文でINSERTすると、リージョンごとの部分ユニークインデックスに当たり得るため文を分ける。
+		// 通知は行として作らず、受け取る側(GET /api/notifications)で投稿期間と利用者から求める(notification_api.go)。
+		// asiaでは利用者が約4,900人おり、一括INSERTで投稿期間の開始が数秒〜10秒かかっていたため。
 		var window PostingWindow
 		if err := tx.GetContext(ctx, &window, `
    WITH window_row AS (
      INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
      VALUES ($1, $2, $3, $4, $5)
      RETURNING id, region, local_date, starts_at, on_time_deadline, ended_at
-   ), notified AS (
-     INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-     SELECT gen_random_uuid()::text, u.id, w.id, w.starts_at FROM window_row w JOIN users u ON u.region = w.region AND u.status = 'active'
    )
    SELECT id, region, local_date, starts_at, on_time_deadline, ended_at FROM window_row
    CROSS JOIN (SELECT pg_notify('posting_window', $2::text)) AS notify
