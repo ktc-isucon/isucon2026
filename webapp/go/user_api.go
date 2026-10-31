@@ -92,8 +92,14 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		ctx := c.Request().Context()
 		// ユーザー名の一意性はusers_usernameのユニークインデックスで保証し、テーブルロックは取らない。
 		var user User
-		err := h.DB.GetContext(ctx, &user, `INSERT INTO users (id, username, secret_key_hash, display_name, region) VALUES ($1, $2, $3, $4, $5) RETURNING `+strings.Join(userColumns, ", "),
-			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region)
+		// 検索用の列には、Go で正規化した値を一緒に書く(user_search.go)
+		insertSQL := `INSERT INTO users (id, username, secret_key_hash, display_name, region) VALUES ($1, $2, $3, $4, $5) RETURNING ` + strings.Join(userColumns, ", ")
+		args := []any{uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region}
+		if userSearchReady.Load() {
+			insertSQL = `INSERT INTO users (id, username, secret_key_hash, display_name, region, search_username, search_display_name) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ` + strings.Join(userColumns, ", ")
+			args = append(args, normalizeSearchText(input.Username), normalizeSearchText(input.DisplayName))
+		}
+		err := h.DB.GetContext(ctx, &user, insertSQL, args...)
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
 			return NewAPIError(http.StatusConflict, "username_taken")
@@ -220,10 +226,23 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		// 前の実装(更新後に getUser で見つからなければロールバックして404)と同じく、無効なユーザーは何も変わらない。
 		// リージョンを変えるときは、セッションのキャッシュがリージョンを持つので全サーバーで消す(通知はコミット時に届く)
 		var user User
+		// 表示名を変えるときは、検索用の列にも Go で正規化した値を書く(user_search.go)
+		searchDisplayNameSet := ""
+		args := []any{session.UserID, input.DisplayName, input.Bio, input.Region}
+		if userSearchReady.Load() {
+			searchDisplayNameSet = "search_display_name = COALESCE($5::text, search_display_name),"
+			var normalized *string
+			if input.DisplayName != nil {
+				n := normalizeSearchText(*input.DisplayName)
+				normalized = &n
+			}
+			args = append(args, normalized)
+		}
 		err := sqlx.GetContext(ctx, h.DB, &user, `
   WITH u AS (
     UPDATE users SET
       display_name = COALESCE($2::text, display_name),
+      `+searchDisplayNameSet+`
       bio = COALESCE($3::text, bio),
       region = COALESCE($4::text, region),
       updated_at = clock_timestamp()
@@ -232,7 +251,7 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
   )
   SELECT `+prefixedUserColumns("u")+` FROM u
   LEFT JOIN LATERAL (SELECT pg_notify('`+sessionInvalidateChannel+`', u.id::text) WHERE $4::text IS NOT NULL) AS notify ON true
- `, session.UserID, input.DisplayName, input.Bio, input.Region)
+ `, args...)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}

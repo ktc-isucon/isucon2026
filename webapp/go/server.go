@@ -3,6 +3,7 @@ package isureal
 import (
 	"context"
 	"os"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
@@ -47,6 +48,17 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to ping database: " + err.Error())
 	}
 	go logDBPoolStats(db)
+	// ユーザー検索用の列とインデックスを用意し、正規化した値を埋める。終わるまでは今までの検索で動く
+	go func() {
+		for {
+			err := prepareUserSearch(context.Background(), db)
+			if err == nil {
+				return
+			}
+			e.Logger.Error("failed to prepare user search", "error", err)
+			time.Sleep(5 * time.Second)
+		}
+	}()
 
 	handlerContext := &HandlerContext{
 		DB:     db,

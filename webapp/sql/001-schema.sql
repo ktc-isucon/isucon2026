@@ -82,10 +82,16 @@ CREATE TABLE users (
   status text NOT NULL DEFAULT 'active',
   deleted_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  -- ユーザー検索用に、アプリが Go で正規化(NFC(Fold(NFC(x))))して埋める
+  search_username text,
+  search_display_name text
 );
 ALTER TABLE image_objects ADD CONSTRAINT image_objects_owner_fk FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE RESTRICT;
 CREATE UNIQUE INDEX users_username ON users(username);
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX users_search_username_trgm ON users USING gin (search_username gin_trgm_ops);
+CREATE INDEX users_search_display_name_trgm ON users USING gin (search_display_name gin_trgm_ops);
 
 -- 2026-09-10 管理者を消す時のオペレーションはどうすればよいですか？
 -- 2026-09-13 消すことは想定されていません

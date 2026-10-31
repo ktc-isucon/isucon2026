@@ -24,6 +24,14 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := cmd.Run(); err != nil {
 			return err
 		}
+		// reset.sql は初期ユーザーの表示名を戻すので、ユーザー検索用の正規化した列を合わせ直す(食い違う行だけ更新)
+		if userSearchReady.Load() {
+			if err := backfillUserSearchColumns(c.Request().Context(), h.DB); err != nil {
+				return err
+			}
+		} else if err := prepareUserSearch(c.Request().Context(), h.DB); err != nil {
+			log.Printf("failed to prepare user search: %v", err)
+		}
 		// ip_bansはTRUNCATEされたので、古いBANが残らないようすぐに読み直す(このサーバーで書き込み待ちの控えも捨てる)
 		h.IPBans.resetLocal()
 		if err := h.IPBans.Reload(c.Request().Context(), h.DB); err != nil {

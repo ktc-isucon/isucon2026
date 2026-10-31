@@ -56,3 +56,8 @@ ALTER TABLE image_objects ADD COLUMN IF NOT EXISTS origin_region text;
 CREATE INDEX IF NOT EXISTS friend_requests_requester_recipient ON friend_requests(requester_id, recipient_id);
 CREATE INDEX IF NOT EXISTS friend_requests_recipient_requester ON friend_requests(recipient_id, requester_id);
 CREATE INDEX IF NOT EXISTS follows_followee_id ON follows(followee_id);
+-- ユーザー検索用に正規化した名前の列と、部分一致用の pg_trgm インデックス(値はアプリが Go で正規化して埋める)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS search_username text, ADD COLUMN IF NOT EXISTS search_display_name text;
+CREATE INDEX IF NOT EXISTS users_search_username_trgm ON users USING gin (search_username gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS users_search_display_name_trgm ON users USING gin (search_display_name gin_trgm_ops);
