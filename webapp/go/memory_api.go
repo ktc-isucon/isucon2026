@@ -271,10 +271,7 @@ func (t *imageSignatureTargets) prewarm() {
 	if len(t.targets) < 2 {
 		return
 	}
-	exp := time.Now().Add(imageURLLifetime).Unix()
-	if r := exp % imageURLExpGranularity; r != 0 {
-		exp += imageURLExpGranularity - r
-	}
+	exp := imageURLExp(time.Now())
 	workers := min(runtime.GOMAXPROCS(0), len(t.targets))
 	ch := make(chan imageSignatureTarget)
 	var wg sync.WaitGroup

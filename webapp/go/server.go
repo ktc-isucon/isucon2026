@@ -43,6 +43,7 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
 	}
+	go logDBPoolStats(db)
 
 	handlerContext := &HandlerContext{
 		DB:     db,

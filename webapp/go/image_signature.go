@@ -25,7 +25,14 @@ var imageSignatureCache = struct {
 	sync.Mutex
 	current  map[string][]byte
 	previous map[string][]byte
-}{current: make(map[string][]byte)}
+	// 計算中の署名。同じ署名を同時に求めたリクエストは、先に始めた計算の完了を待って結果を共有する
+	inflight map[string]*imageSignatureCall
+}{current: make(map[string][]byte), inflight: make(map[string]*imageSignatureCall)}
+
+type imageSignatureCall struct {
+	done chan struct{}
+	sig  []byte
+}
 
 func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	key, err := hex.DecodeString(secretKeyHash)
@@ -50,18 +57,37 @@ func imageSignature(key []byte, imageID string, exp int64) []byte {
 		imageSignatureCache.Unlock()
 		return sig
 	}
+	if call, ok := imageSignatureCache.inflight[cacheKey]; ok {
+		imageSignatureCache.Unlock()
+		<-call.done
+		return call.sig
+	}
+	call := &imageSignatureCall{done: make(chan struct{})}
+	imageSignatureCache.inflight[cacheKey] = call
 	imageSignatureCache.Unlock()
 
-	sig := computeImageSignature(key, imageID, exp)
+	call.sig = computeImageSignature(key, imageID, exp)
 
 	imageSignatureCache.Lock()
 	if len(imageSignatureCache.current) >= imageSignatureCacheGenerationSize {
 		imageSignatureCache.previous = imageSignatureCache.current
 		imageSignatureCache.current = make(map[string][]byte)
 	}
-	imageSignatureCache.current[cacheKey] = sig
+	imageSignatureCache.current[cacheKey] = call.sig
+	delete(imageSignatureCache.inflight, cacheKey)
 	imageSignatureCache.Unlock()
-	return sig
+	close(call.done)
+	return call.sig
+}
+
+// imageURLExp は署名URLの有効期限を返す。24時間以上を保ったまま imageURLExpGranularity 秒単位に切り上げる
+// (最大で imageURLExpGranularity 秒長くなる)。signedImageURL と署名の事前計算で同じ値を使う。
+func imageURLExp(now time.Time) int64 {
+	exp := now.Add(imageURLLifetime).Unix()
+	if r := exp % imageURLExpGranularity; r != 0 {
+		exp += imageURLExpGranularity - r
+	}
+	return exp
 }
 
 func computeImageSignature(key []byte, imageID string, exp int64) []byte {
@@ -84,11 +110,7 @@ func computeImageSignature(key []byte, imageID string, exp int64) []byte {
 }
 
 func signedImageURL(user User, imageID string) string {
-	// 有効期限は24時間以上を保ったまま切り上げる(最大で imageURLExpGranularity 秒長くなる)
-	exp := time.Now().Add(imageURLLifetime).Unix()
-	if r := exp % imageURLExpGranularity; r != 0 {
-		exp += imageURLExpGranularity - r
-	}
+	exp := imageURLExp(time.Now())
 	query := url.Values{
 		"exp": {strconv.FormatInt(exp, 10)},
 		"sig": {base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))},
