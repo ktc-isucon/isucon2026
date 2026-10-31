@@ -31,9 +31,14 @@ func deleteAccountHandler(h *HandlerContext) echo.HandlerFunc {
 		if _, err := tx.ExecContext(ctx, `UPDATE login_sessions SET active=false, invalidated_at=clock_timestamp(), reason='account_deletion' WHERE user_id=$1 AND active=true`, userID); err != nil {
 			return err
 		}
+		// セッションのキャッシュを全サーバーで消す(通知はコミット時に届く)
+		if err := notifySessionInvalidated(ctx, tx, userID); err != nil {
+			return err
+		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		sessions.invalidateUser(userID)
 		return c.NoContent(http.StatusNoContent)
 	}
 }

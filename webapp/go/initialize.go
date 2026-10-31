@@ -28,6 +28,11 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := h.IPBans.Reload(c.Request().Context(), h.DB); err != nil {
 			return err
 		}
+		// login_sessionsはTRUNCATEされ、ユーザーのリージョンや状態も戻るので、全サーバーのセッションのキャッシュを消す
+		sessions.clear()
+		if err := notifyAllSessionsInvalidated(c.Request().Context(), h.DB); err != nil {
+			return err
+		}
 		// ベンチ中に追加された画像(isu3のruntime/)を消す
 		if err := resetRuntimeImages(); err != nil {
 			log.Printf("failed to reset runtime images: %v", err)

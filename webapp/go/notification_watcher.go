@@ -111,12 +111,22 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 	if _, err := conn.Exec(ctx, "LISTEN "+postingWindowChannel); err != nil {
 		return err
 	}
+	if _, err := conn.Exec(ctx, "LISTEN "+sessionInvalidateChannel); err != nil {
+		return err
+	}
+	// セッションの無効化を受け取れる間だけキャッシュを使う。切れている間の通知は取りこぼすので、繋ぎ直しても中身は捨てる
+	sessions.setEnabled(true)
+	defer sessions.setEnabled(false)
 	connected()
 	w.requestRefresh()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			return err
+		}
+		if n.Channel == sessionInvalidateChannel {
+			sessions.handleNotification(n.Payload)
+			continue
 		}
 		w.mu.Lock()
 		if ch, ok := w.changed[n.Payload]; ok {
