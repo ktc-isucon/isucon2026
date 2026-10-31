@@ -402,6 +402,8 @@ tasks:
           if echo {{.DEPLOY_NGINX_SERVER_NAMES}} | grep -qw "\b{{.SERVER_NAME}}\b"; then
             ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
             $ssht "sudo systemctl daemon-reload"
+            # 再起動後も上がるよう自動起動も有効にする(isu3は画像の置き場所なので特に必要)
+            $ssht "sudo systemctl enable {{.NGINX_SERVICE_NAME}}"
             $ssht "sudo systemctl restart {{.NGINX_SERVICE_NAME}}"
           else
             echo "Skip restart nginx on {{.SERVER_NAME}}"
