@@ -3,11 +3,14 @@ package isureal
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,8 +22,12 @@ import (
 const (
 	imageKindInitial = "initial"
 	imageKindRuntime = "runtime"
-	// isu0〜2のnginxが初期データの画像をキャッシュする場所(proxy_storeの保存先)
+	// isu0〜2のnginxが画像をキャッシュする場所(proxy_storeの保存先)
 	localImageCacheRoot = "/home/isucon/image-cache"
+	// ベンチ中に追加された画像の手元キャッシュ。nginx(www-data)とアプリ(isucon)の両方が書く
+	localRuntimeImageDir = localImageCacheRoot + "/_img/" + imageKindRuntime
+	// imageCacheResetChannel は初期化時に全サーバーの手元のruntimeキャッシュを消すためのLISTEN/NOTIFYのチャネル名
+	imageCacheResetChannel = "image_cache_reset"
 )
 
 var (
@@ -72,7 +79,52 @@ func putRuntimeImageAsync(id string, data []byte) <-chan error {
 	go func() {
 		done <- storeRequest(http.MethodPut, "/images/"+imageRelPath(imageKindRuntime, id), data)
 	}()
+	// アップロードしたサーバーでは手元にも置いておき、isu3からの取得を省く(失敗してもnginxがisu3から取得する)
+	go writeLocalRuntimeImage(id, data)
 	return done
+}
+
+// writeLocalRuntimeImage は手元のruntimeキャッシュに画像を書く(ベストエフォート)。
+// 画像の中身はIDごとに不変で、閲覧可否は配信のたびにDBで確認するため、キャッシュが古くなることはない。
+func writeLocalRuntimeImage(id string, data []byte) {
+	path := localImageCacheRoot + "/_img/" + imageRelPath(imageKindRuntime, id)
+	dir := path[:strings.LastIndex(path, "/")]
+	if err := os.MkdirAll(dir, 0o775); err != nil {
+		return
+	}
+	// nginx(www-data)もこのディレクトリにproxy_storeで書くため、グループにも書き込みを許す
+	_ = os.Chmod(dir, 0o2775)
+	tmp := path + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+	}
+}
+
+// resetLocalRuntimeImages は手元のruntimeキャッシュを消す。初期化を止めないよう、
+// ディレクトリを退避してからバックグラウンドで削除する。
+func resetLocalRuntimeImages() {
+	trash := localRuntimeImageDir + ".trash-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := os.Rename(localRuntimeImageDir, trash); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "failed to reset local runtime images: %v\n", err)
+		}
+		return
+	}
+	go func() {
+		if err := os.RemoveAll(trash); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to remove local runtime images: %v\n", err)
+		}
+	}()
+}
+
+// notifyImageCacheReset は他サーバーにも手元のruntimeキャッシュを消すよう知らせる。
+func notifyImageCacheReset(ctx context.Context, db sqlx.ExecerContext) error {
+	_, err := db.ExecContext(ctx, `SELECT pg_notify('`+imageCacheResetChannel+`', '')`)
+	return err
 }
 
 // deleteRuntimeImage はisu3上の画像を消す(ベストエフォート)。初期データの画像は初期化で戻せないため消さない。
@@ -119,10 +171,8 @@ func storeRequest(method, path string, body []byte) error {
 // readImage は画像本体を返す(エクスポート用)。手元のnginxキャッシュ→isu3の順に探す。
 func readImage(ctx context.Context, kind, id string) ([]byte, error) {
 	rel := imageRelPath(kind, id)
-	if kind == imageKindInitial {
-		if data, err := os.ReadFile(localImageCacheRoot + "/_img/" + rel); err == nil {
-			return data, nil
-		}
+	if data, err := os.ReadFile(localImageCacheRoot + "/_img/" + rel); err == nil {
+		return data, nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageStoreURL+"/_img/"+rel, nil)
 	if err != nil {

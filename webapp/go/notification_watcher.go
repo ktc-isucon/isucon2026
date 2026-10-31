@@ -114,6 +114,11 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 	if _, err := conn.Exec(ctx, "LISTEN "+sessionInvalidateChannel); err != nil {
 		return err
 	}
+	if _, err := conn.Exec(ctx, "LISTEN "+imageCacheResetChannel); err != nil {
+		return err
+	}
+	// 切れている間に初期化の通知を取りこぼしたかもしれないので、手元のruntime画像キャッシュは捨てる
+	resetLocalRuntimeImages()
 	// セッションの無効化を受け取れる間だけキャッシュを使う。切れている間の通知は取りこぼすので、繋ぎ直しても中身は捨てる
 	sessions.setEnabled(true)
 	defer sessions.setEnabled(false)
@@ -126,6 +131,10 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 		}
 		if n.Channel == sessionInvalidateChannel {
 			sessions.handleNotification(n.Payload)
+			continue
+		}
+		if n.Channel == imageCacheResetChannel {
+			resetLocalRuntimeImages()
 			continue
 		}
 		w.mu.Lock()
