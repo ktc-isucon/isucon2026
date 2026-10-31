@@ -9,12 +9,8 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 )
-
-// imageSignatureComputeCount は HMAC 1000回を実際に計算した回数(テストと効果の確認用)
-var imageSignatureComputeCount atomic.Int64
 
 const imageURLLifetime = 24 * time.Hour
 const imageSignatureIterations = 1000
@@ -22,10 +18,8 @@ const imageSignatureIterations = 1000
 // signedImageURLのexpをこの秒数単位で切り上げ、同じ画像の署名を使い回せるようにする
 const imageURLExpGranularity = 60
 
-// 署名(HMAC 1000回)のメモ。1世代の件数が上限に達したら新しい世代に切り替え、古い世代を捨てる。
-// 次の枠の先回り計算(imageSignaturePrecompute)の分も入るので、今の枠の分が追い出されないよう大きめにする
-// (1件あたり200バイト前後。2世代で最大約120MB)
-const imageSignatureCacheGenerationSize = 300000
+// 署名(HMAC 1000回)のメモ。1世代の件数が上限に達したら新しい世代に切り替え、古い世代を捨てる
+const imageSignatureCacheGenerationSize = 100000
 
 var imageSignatureCache = struct {
 	sync.Mutex
@@ -73,7 +67,6 @@ func imageSignature(key []byte, imageID string, exp int64) []byte {
 	imageSignatureCache.Unlock()
 
 	call.sig = computeImageSignature(key, imageID, exp)
-	imageSignatureComputeCount.Add(1)
 
 	imageSignatureCache.Lock()
 	if len(imageSignatureCache.current) >= imageSignatureCacheGenerationSize {
@@ -120,7 +113,7 @@ func signedImageURL(user User, imageID string) string {
 	exp := imageURLExp(time.Now())
 	query := url.Values{
 		"exp": {strconv.FormatInt(exp, 10)},
-		"sig": {base64.RawURLEncoding.EncodeToString(imageSignatureForURL(user.ImageKey, imageID, exp))},
+		"sig": {base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))},
 	}
 	return "/api/images/" + url.PathEscape(imageID) + "?" + query.Encode()
 }
