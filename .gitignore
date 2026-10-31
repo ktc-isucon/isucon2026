@@ -28,3 +28,5 @@ local
 /go
 /env.sh
 .idea
+/images/
+/image-cache/
