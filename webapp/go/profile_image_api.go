@@ -67,6 +67,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		userViews.invalidateUser(userID)
 		for _, createdAt := range oldCreatedAt {
 			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
 				deleteRuntimeImage(kind, *oldID)
@@ -106,6 +107,7 @@ func deleteProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		userViews.invalidateUser(userID)
 		for _, createdAt := range deletedCreatedAt {
 			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
 				deleteRuntimeImage(kind, *imageID)

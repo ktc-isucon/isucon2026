@@ -26,6 +26,11 @@ type getCurrentPostingWindowResponse struct {
 
 func getCurrentPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		userID := GetSession(c).UserID
+		cached, epoch := userViews.begin(userID)
+		if cached.window != nil {
+			return c.JSON(http.StatusOK, newGetCurrentPostingWindowResponse(*cached.window))
+		}
 		var state struct {
 			PostingWindow
 			Active  int `db:"active"`
@@ -40,21 +45,33 @@ func getCurrentPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
    LEFT JOIN posts p ON p.author_id = u.id AND p.posting_window_id = posted_window.id
    WHERE u.id = $1
    GROUP BY w.id
-  `, GetSession(c).UserID)
+  `, userID)
+		var result cachedPostingWindowState
 		if errors.Is(err, sql.ErrNoRows) {
-			return c.JSON(http.StatusOK, getCurrentPostingWindowResponse{})
-		}
-		if err != nil {
+			result = cachedPostingWindowState{}
+		} else if err != nil {
 			return err
+		} else {
+			result = cachedPostingWindowState{found: true, window: state.PostingWindow, active: state.Active, deleted: state.Deleted}
 		}
-		return c.JSON(http.StatusOK, getCurrentPostingWindowResponse{
-			Window: &currentPostingWindowResponse{
-				ID: state.ID, Region: state.Region, LocalDate: state.LocalDate.Format(time.DateOnly),
-				StartsAt: state.StartsAt, OnTimeDeadline: state.OnTimeDeadline,
-			},
-			HasPosted:     state.Active > 0,
-			CanPost:       state.Active == 0 && state.Deleted < 2 && !time.Now().Before(state.StartsAt),
-			DeletionCount: state.Deleted,
-		})
+		userViews.putWindow(epoch, userID, result)
+		return c.JSON(http.StatusOK, newGetCurrentPostingWindowResponse(result))
+	}
+}
+
+// newGetCurrentPostingWindowResponse はDBの結果(キャッシュ)から応答を作る。canPost は時刻に依存するので毎回計算する。
+func newGetCurrentPostingWindowResponse(state cachedPostingWindowState) getCurrentPostingWindowResponse {
+	if !state.found {
+		return getCurrentPostingWindowResponse{}
+	}
+	w := state.window
+	return getCurrentPostingWindowResponse{
+		Window: &currentPostingWindowResponse{
+			ID: w.ID, Region: w.Region, LocalDate: w.LocalDate.Format(time.DateOnly),
+			StartsAt: w.StartsAt, OnTimeDeadline: w.OnTimeDeadline,
+		},
+		HasPosted:     state.active > 0,
+		CanPost:       state.active == 0 && state.deleted < 2 && !time.Now().Before(w.StartsAt),
+		DeletionCount: state.deleted,
 	}
 }

@@ -3,6 +3,7 @@ package isureal
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -122,6 +123,8 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 	// セッションの無効化を受け取れる間だけキャッシュを使う。切れている間の通知は取りこぼすので、繋ぎ直しても中身は捨てる
 	sessions.setEnabled(true)
 	defer sessions.setEnabled(false)
+	userViews.setEnabled(true)
+	defer userViews.setEnabled(false)
 	connected()
 	w.requestRefresh()
 	for {
@@ -131,12 +134,16 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 		}
 		if n.Channel == sessionInvalidateChannel {
 			sessions.handleNotification(n.Payload)
+			userViews.handleSessionNotification(n.Payload)
 			continue
 		}
 		if n.Channel == imageCacheResetChannel {
 			resetLocalRuntimeImages()
 			continue
 		}
+		// 投稿期間が変わったので、SSEの購読者に知らせる前に、今の投稿期間と今日の投稿のキャッシュを消す。
+		// こうすると、通知を受けて current を読み直したユーザーは必ず新しい投稿期間を読む
+		userViews.clear()
 		w.mu.Lock()
 		if ch, ok := w.changed[n.Payload]; ok {
 			close(ch)
@@ -200,6 +207,10 @@ func (w *notificationWatcher) pollWindows(ctx context.Context) {
 
 		w.mu.Lock()
 		first := w.windows == nil
+		if !first && !maps.Equal(w.windows, next) {
+			// NOTIFY より先にポーリングで変化に気づいた場合も、念のためキャッシュを消す
+			userViews.clear()
+		}
 		for region, ch := range w.changed {
 			// 初回取得時は、取得前に接続した購読者に念のため再確認させる
 			if first || w.windows[region] != next[region] {
