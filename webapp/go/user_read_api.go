@@ -49,7 +49,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 			Username    string `db:"username"`
 			DisplayName string `db:"display_name"`
 		}
-		if err := h.DB.SelectContext(ctx, &candidates, `
+		if err := h.ReadDB(c).SelectContext(ctx, &candidates, `
    SELECT u.id, u.username, u.display_name FROM users u
    WHERE u.status='active' AND u.id<>$1 AND ($2='' OR (u.username,u.id)>($2,$3))
      AND NOT EXISTS (
@@ -75,7 +75,7 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		items := make([]relationshipUserResponse, 0, len(matchedIDs))
 		if len(matchedIDs) > 0 {
 			var users []User
-			if err := h.DB.SelectContext(ctx, &users, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = ANY($1) AND status='active'`, matchedIDs); err != nil {
+			if err := h.ReadDB(c).SelectContext(ctx, &users, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = ANY($1) AND status='active'`, matchedIDs); err != nil {
 				return err
 			}
 			byID := make(map[string]User, len(users))
@@ -118,21 +118,21 @@ func getUserHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		viewer := GetSession(c).UserID
-		user, err := getUser(ctx, h.DB, input.UserID)
+		user, err := getUser(ctx, h.ReadDB(c), input.UserID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		blocked, err := isBlocked(ctx, h.DB, viewer, user.ID)
+		blocked, err := isBlocked(ctx, h.ReadDB(c), viewer, user.ID)
 		if err != nil {
 			return err
 		}
 		if blocked {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
-		friends, err := getFriendIDs(ctx, h.DB, viewer)
+		friends, err := getFriendIDs(ctx, h.ReadDB(c), viewer)
 		if err != nil {
 			return err
 		}

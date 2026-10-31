@@ -15,6 +15,8 @@ type HandlerContext struct {
 	DB     *sqlx.DB
 	Config *Config
 	IPBans *IPBanList
+	// 読み取り用の手元のレプリカ。nilなら全てprimaryで処理する
+	Replica *replicaReader
 
 	Notifications *notificationWatcher
 }
@@ -49,6 +51,11 @@ func NewServer(config *Config) *echo.Echo {
 
 		Notifications: newNotificationWatcher(db, config.DatabaseDSN()),
 	}
+	if replica := openReplica(config.ReplicaDatabaseDSN()); replica != nil {
+		handlerContext.Replica = &replicaReader{primary: db, replica: replica}
+	}
+	// 読み取り専用のルートだけ、追いついたレプリカで読む
+	ro := ReplicaReadMiddleware(handlerContext)
 	go handlerContext.Notifications.run(context.Background())
 	// 最初のリクエストからBANを反映できるよう、起動時に一度読んでから裏で読み直す
 	if err := handlerContext.IPBans.Reload(context.Background(), db); err != nil {
@@ -61,34 +68,34 @@ func NewServer(config *Config) *echo.Echo {
 	e.POST("/api/auth/register", registerHandler(handlerContext))
 	e.POST("/api/auth/login", loginHandler(handlerContext))
 	e.POST("/api/auth/logout", logoutHandler(handlerContext), SessionMiddleware(handlerContext, true))
-	e.GET("/api/users", searchUsersHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/users/:userId", getUserHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/me/export", exportPostsHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/me", getMeHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/users", searchUsersHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/users/:userId", getUserHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/me/export", exportPostsHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/me", getMeHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.PATCH("/api/me", updateMeHandler(handlerContext), SessionMiddleware(handlerContext, true))
 	e.PUT("/api/me/profile-image", putProfileImageHandler(handlerContext), SessionMiddleware(handlerContext, true))
 	e.DELETE("/api/me/profile-image", deleteProfileImageHandler(handlerContext), SessionMiddleware(handlerContext, true))
 	e.POST("/api/me/account-deletion", deleteAccountHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.POST("/api/posts", createPostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/posting-window/current", getCurrentPostingWindowHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/posts/me/current", getMyCurrentPostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/posts/:postId", getPostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/posting-window/current", getCurrentPostingWindowHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/posts/me/current", getMyCurrentPostHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/posts/:postId", getPostHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.PATCH("/api/posts/:postId", updatePostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.DELETE("/api/posts/:postId", deletePostHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/feeds/:feed", getFeedHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/memories", getMemoriesHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/memories/:date", getMemoriesByDateHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/feeds/:feed", getFeedHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/memories", getMemoriesHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/memories/:date", getMemoriesByDateHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.POST("/api/posts/:postId/comments", createCommentHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/posts/:postId/comments", getCommentsHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/posts/:postId/comments", getCommentsHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.DELETE("/api/comments/:commentId", deleteCommentHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.POST("/api/posts/:postId/realmojis", replaceRealMojiHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/posts/:postId/realmojis", getRealMojisHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/posts/:postId/realmojis", getRealMojisHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.DELETE("/api/realmojis/:realMojiId", deleteRealMojiHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/images/:imageId", getImageHandler(handlerContext))
+	e.GET("/api/images/:imageId", getImageHandler(handlerContext), ro)
 	e.GET("/api/notifications", getNotificationsHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.POST("/api/friend-requests", createFriendRequestHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.POST("/api/friend-requests/:requestId/:action", transitionFriendRequestHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
-	e.GET("/api/relationships/:kind", getRelationshipsHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
+	e.GET("/api/relationships/:kind", getRelationshipsHandler(handlerContext), ro, SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.DELETE("/api/friendships/:userId", deleteFriendshipHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.PUT("/api/follows/:userId", followHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
 	e.DELETE("/api/follows/:userId", unfollowHandler(handlerContext), SessionMiddleware(handlerContext, true), RegionMiddleware(handlerContext))
