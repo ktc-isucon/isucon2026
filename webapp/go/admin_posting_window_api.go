@@ -43,38 +43,43 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		// usersのテーブルロックは取らず、同じリージョンの開始処理だけを直列化する。
+		// 競合の確認はロック取得後の文で行う(同じ文だとロック待ち前のスナップショットで判定してしまう)。
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('posting_window:' || $1))`, region); err != nil {
 			return err
 		}
-		var conflict bool
-		if err := tx.GetContext(ctx, &conflict, `SELECT EXISTS(SELECT 1 FROM posting_windows WHERE region = $1 AND local_date >= $2)`, region, localDate); err != nil {
+		var opened struct {
+			Conflict bool      `db:"conflict"`
+			StartsAt time.Time `db:"starts_at"`
+		}
+		if err := tx.GetContext(ctx, &opened, `
+   WITH checked AS MATERIALIZED (
+     SELECT EXISTS(SELECT 1 FROM posting_windows WHERE region = $1 AND local_date >= $2) AS conflict, clock_timestamp() AS starts_at
+   ), ended AS (
+     UPDATE posting_windows SET ended_at = (SELECT starts_at FROM checked)
+     WHERE region = $1 AND ended_at IS NULL AND NOT (SELECT conflict FROM checked)
+   )
+   SELECT conflict, starts_at FROM checked
+  `, region, localDate); err != nil {
 			return err
 		}
-		if conflict {
+		if opened.Conflict {
 			return NewAPIError(http.StatusConflict, "posting_window_conflict")
 		}
-		var startsAt time.Time
-		if err := tx.GetContext(ctx, &startsAt, `SELECT clock_timestamp()`); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE posting_windows SET ended_at = $2 WHERE region = $1 AND ended_at IS NULL`, region, startsAt); err != nil {
-			return err
-		}
-		windowID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `
-   INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
-   VALUES ($1, $2, $3, $4, $5)
-  `, windowID, region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-   INSERT INTO notifications (id, user_id, posting_window_id, created_at)
-   SELECT gen_random_uuid()::text, id, $2, $3 FROM users WHERE region = $1 AND status = 'active'
-  `, region, windowID, startsAt); err != nil {
-			return err
-		}
-		window, err := getPostingWindow(ctx, tx, windowID)
-		if err != nil {
+		startsAt := opened.StartsAt
+		// 終了させたUPDATEと同じ文でINSERTすると、リージョンごとの部分ユニークインデックスに当たり得るため文を分ける。
+		var window PostingWindow
+		if err := tx.GetContext(ctx, &window, `
+   WITH window_row AS (
+     INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, region, local_date, starts_at, on_time_deadline, ended_at
+   ), notified AS (
+     INSERT INTO notifications (id, user_id, posting_window_id, created_at)
+     SELECT gen_random_uuid()::text, u.id, w.id, w.starts_at FROM window_row w JOIN users u ON u.region = w.region AND u.status = 'active'
+   )
+   SELECT id, region, local_date, starts_at, on_time_deadline, ended_at FROM window_row
+  `, uuid.NewString(), region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
