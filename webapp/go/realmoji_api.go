@@ -65,49 +65,66 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		post, err := getPost(ctx, h.DB, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if err != nil {
-			return err
-		}
-		if actor == post.AuthorID {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
+		// 画像本体はisu3へ保存する。画像の行はPUTが成功したときだけ作るので、バッチを送る前に完了を待つ
 		imageID := uuid.NewString()
-		imageStored := putRuntimeImageAsync(imageID, data)
-		tx, err := beginRelationshipTx(ctx, h.DB, actor, post.AuthorID)
-		if err != nil {
+		if err := <-putRuntimeImageAsync(imageID, data); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		allowed, err := canViewPost(ctx, tx, actor, post.ID)
-		if err != nil {
+		// BEGIN〜COMMITを1往復で送る。
+		// 1文目: 自分と投稿者のペアのadvisory lockと、2人の行の FOR SHARE(beginRelationshipTx と同じロック)。
+		//        投稿者は投稿IDから引く
+		// 2文目: ロック後のスナップショットで閲覧できるか(canViewPost と同じ判定)を1回だけ評価し、
+		//        結果をトランザクション内だけ有効な設定値に入れる。後続の文はこの値を見て、許可されたときだけ変更する
+		//        (置き換え前の無効化と新規作成は、部分ユニークインデックスの判定順の都合で別の文にする必要があり、
+		//         文ごとに判定し直すと、その間に関係が変わったとき置き換えだけが起きうるため)
+		// 3〜5文目: 置き換え前の無効化、画像の行の作成、RealMojiの作成と応答用のユーザー取得
+		const realmojiOK = `current_setting('isureal.realmoji_ok') = 'true'`
+		var reaction RealMoji
+		var user User
+		var created bool
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql: `
+   WITH author AS (SELECT author_id AS id FROM posts WHERE id = $2 AND deleted_at IS NULL)
+   SELECT id FROM users
+   WHERE id IN ($1, (SELECT id FROM author)) AND status = 'active'
+     AND (SELECT count(*) FROM (SELECT pg_advisory_xact_lock(hashtextextended(
+           'relationship:' || least($1::text, (SELECT id FROM author)) || ':' || greatest($1::text, (SELECT id FROM author)), 0))) l) = 1
+   ORDER BY id FOR SHARE`,
+				args: []any{actor, input.PostID},
+			},
+			pipelinedStmt{
+				sql:  `SELECT set_config('isureal.realmoji_ok', (` + postInteractionAllowedSQL("$1::text", "$2::text", false) + `)::text, true)`,
+				args: []any{actor, input.PostID},
+			},
+			pipelinedStmt{
+				sql:  `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL AND ` + realmojiOK,
+				args: []any{input.PostID, actor},
+			},
+			pipelinedStmt{
+				sql:  `INSERT INTO image_objects(id,owner_user_id,data,media_type) SELECT $1::text, $2::text, ''::bytea, 'image/jpeg' WHERE ` + realmojiOK,
+				args: []any{imageID, actor},
+			},
+			pipelinedStmt{
+				sql: `
+   WITH r AS (
+     INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at)
+     SELECT $1::text, $2::text, $3::text, $4::text, $5::text, clock_timestamp() WHERE ` + realmojiOK + `
+     RETURNING id, post_id, reactor_id, image_id, reaction_type, created_at, replaced_at, deleted_at
+   )
+   SELECT r.id, r.post_id, r.reactor_id, r.image_id, r.reaction_type, r.created_at, r.replaced_at, r.deleted_at, ` + prefixedUserColumns("u") + `
+   FROM r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'`,
+				args: []any{uuid.NewString(), input.PostID, actor, imageID, input.ReactionType},
+				scan: scanFirstRow(&created, append([]any{&reaction.ID, &reaction.PostID, &reaction.ReactorID, &reaction.ImageID,
+					&reaction.ReactionType, &reaction.CreatedAt, &reaction.ReplacedAt, &reaction.DeletedAt}, userScanDest(&user)...)...),
+			},
+		); err != nil {
 			return err
 		}
-		if !allowed {
+		if !created {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL`, post.ID, actor); err != nil {
-			return err
-		}
-		if err := <-imageStored; err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,''::bytea,'image/jpeg')`, imageID, actor); err != nil {
-			return err
-		}
-		var reaction RealMoji
-		if err := tx.GetContext(ctx, &reaction, `INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at) VALUES($1,$2,$3,$4,$5,clock_timestamp()) RETURNING id, post_id, reactor_id, image_id, reaction_type, created_at, replaced_at, deleted_at`, uuid.NewString(), post.ID, actor, imageID, input.ReactionType); err != nil {
-			return err
-		}
-		user, err := getUser(ctx, tx, actor)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))

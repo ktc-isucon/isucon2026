@@ -4,11 +4,11 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/labstack/echo/v5"
 )
 
@@ -39,53 +39,51 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		post, err := getPost(ctx, h.DB, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if err != nil {
-			return err
-		}
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		// 自分と投稿者の行ロックを1往復で取る(ORDER BY id でロック順を固定)。
-		// 応答に使う自分のユーザー情報もここで受け取る
-		ids := slices.Compact([]string{min(actor, post.AuthorID), max(actor, post.AuthorID)})
-		var locked []User
-		if err := tx.SelectContext(ctx, &locked, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE`, ids); err != nil {
-			return err
-		}
-		if len(locked) != len(ids) {
-			return sql.ErrNoRows
-		}
+		// BEGIN〜COMMITを1往復で送る。
+		// 1文目: 自分と投稿者の行ロック(ORDER BY id でロック順を固定)と、応答に使う自分のユーザー情報の取得。
+		//        投稿者は投稿IDから引く(投稿がなければ自分だけをロックし、2文目で403になる)
+		// 2文目: ロック後のスナップショットでコメントできるか(canComment と同じ判定)を確かめ、できるときだけ作成する
 		var user User
-		for _, u := range locked {
-			if u.ID == actor {
-				user = u
-			}
-		}
-		allowed, err := canComment(ctx, tx, actor, post.ID)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
 		var comment Comment
-		if err := tx.GetContext(ctx, &comment, `INSERT INTO comments(id,post_id,author_id,body,created_at) VALUES($1,$2,$3,$4,clock_timestamp()) RETURNING id,post_id,author_id,body,created_at,deleted_at`, uuid.NewString(), post.ID, actor, input.Body); err != nil {
+		var created bool
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql: `SELECT ` + strings.Join(userColumns, ", ") + ` FROM users
+   WHERE id = $1 OR id = (SELECT author_id FROM posts WHERE id = $2 AND deleted_at IS NULL)
+   ORDER BY id FOR NO KEY UPDATE`,
+				args: []any{actor, input.PostID},
+				scan: func(rows pgx.Rows) error {
+					for rows.Next() {
+						var u User
+						if err := rows.Scan(userScanDest(&u)...); err != nil {
+							return err
+						}
+						if u.ID == actor {
+							user = u
+						}
+					}
+					return nil
+				},
+			},
+			pipelinedStmt{
+				sql: `INSERT INTO comments(id,post_id,author_id,body,created_at)
+   SELECT $3::text, $2::text, $1::text, $4::text, clock_timestamp()
+   WHERE ` + postInteractionAllowedSQL("$1::text", "$2::text", true) + `
+   RETURNING id,post_id,author_id,body,created_at,deleted_at`,
+				args: []any{actor, input.PostID, uuid.NewString(), input.Body},
+				scan: scanFirstRow(&created, &comment.ID, &comment.PostID, &comment.AuthorID, &comment.Body, &comment.CreatedAt, &comment.DeletedAt),
+			},
+		); err != nil {
 			return err
+		}
+		if !created {
+			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
 		// 元の getUser と同じく、有効なユーザーでなければエラーにする
 		if user.Status != "active" {
 			return sql.ErrNoRows
 		}
 		if err := user.setImageKey(); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
 			return err
 		}
 		return c.JSON(http.StatusCreated, newCommentResponse(comment, user))
