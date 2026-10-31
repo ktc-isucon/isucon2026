@@ -16,12 +16,16 @@ type initializeResponse struct {
 	Model    string `json:"model"`
 }
 
-func initializeHandler(*HandlerContext) echo.HandlerFunc {
+func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		cmd := exec.Command("../sql/init.sh")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			return err
+		}
+		// ip_bansはTRUNCATEされたので、古いBANが残らないようすぐに読み直す
+		if err := h.IPBans.Reload(c.Request().Context(), h.DB); err != nil {
 			return err
 		}
 		// ベンチ中に追加された画像(isu3のruntime/)を消す

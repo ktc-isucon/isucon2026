@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -28,22 +29,42 @@ type ipBan struct {
 	BannedUntil time.Time `db:"banned_until"`
 }
 
-func (l *IPBanList) Banned(ctx context.Context, db *sqlx.DB, ip string) (bool, error) {
-	snapshot := l.snapshot.Load()
-	if (snapshot == nil || time.Since(snapshot.loadedAt) >= ipBanReloadInterval) && l.reloading.TryLock() {
-		defer l.reloading.Unlock()
-		loaded, err := loadIPBans(ctx, db)
-		if err != nil {
-			return false, err
+// Runは、isureal-guardがip_bansに書いたBANを ipBanReloadInterval ごとに裏で読み直す。
+// リクエストはメモリ上のスナップショットを見るだけなので、読み直しのDB往復を待たない。
+func (l *IPBanList) Run(ctx context.Context, db *sqlx.DB) {
+	ticker := time.NewTicker(ipBanReloadInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
-		l.snapshot.Store(loaded)
-		snapshot = loaded
+		if err := l.Reload(ctx, db); err != nil && ctx.Err() == nil {
+			log.Printf("failed to reload ip bans: %v", err)
+		}
 	}
+}
+
+// Reloadは、ip_bansをすぐに読み直す。起動時と初期化(ip_bansのTRUNCATE)の直後にも呼ぶ。
+func (l *IPBanList) Reload(ctx context.Context, db *sqlx.DB) error {
+	l.reloading.Lock()
+	defer l.reloading.Unlock()
+	loaded, err := loadIPBans(ctx, db)
+	if err != nil {
+		return err
+	}
+	l.snapshot.Store(loaded)
+	return nil
+}
+
+func (l *IPBanList) Banned(ip string) bool {
+	snapshot := l.snapshot.Load()
 	if snapshot == nil {
-		return false, nil
+		return false
 	}
 	until, ok := snapshot.bans[ip]
-	return ok && time.Now().Before(until), nil
+	return ok && time.Now().Before(until)
 }
 
 func loadIPBans(ctx context.Context, db *sqlx.DB) (*ipBanSnapshot, error) {
@@ -68,11 +89,7 @@ func extractClientIP(req *http.Request) string {
 func IPBanMiddleware(h *HandlerContext) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
-			banned, err := h.IPBans.Banned(c.Request().Context(), h.DB, c.RealIP())
-			if err != nil {
-				return err
-			}
-			if banned {
+			if h.IPBans.Banned(c.RealIP()) {
 				return NewAPIError(http.StatusForbidden, "ip_banned")
 			}
 			return next(c)

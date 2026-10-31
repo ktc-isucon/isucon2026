@@ -16,6 +16,8 @@ import (
 func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		if c.Request().Header.Get("Content-Type") != "image/jpeg" {
+			// 本文を読まずに返すと接続が閉じられ、nginxが502にしてしまうため読み捨てる
+			_, _ = io.Copy(io.Discard, io.LimitReader(c.Request().Body, 32<<20))
 			return NewAPIError(http.StatusUnsupportedMediaType, "unsupported_media_type")
 		}
 		data, err := io.ReadAll(c.Request().Body)
