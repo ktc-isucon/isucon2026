@@ -50,3 +50,5 @@ CREATE INDEX IF NOT EXISTS friendships_user_high_id ON friendships(user_high_id)
 -- notificationsはUNIQUE(user_id,posting_window_id)でuser_idから引けるので、通知作成を重くする追加インデックスは持たない
 DROP INDEX IF EXISTS notifications_user_id_created_at;
 CREATE INDEX IF NOT EXISTS login_sessions_token_hash ON login_sessions(token_hash);
+-- ベンチ中に追加された画像を持っているサーバーのリージョン(NULLならisu3から取得する)。列の追加はメタデータのみで一瞬で終わる
+ALTER TABLE image_objects ADD COLUMN IF NOT EXISTS origin_region text;

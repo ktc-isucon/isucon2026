@@ -31,7 +31,15 @@ const (
 )
 
 var (
-	imageStoreURL     = envOrDefault("ISUREAL_IMAGE_STORE_URL", "http://192.168.4.10")
+	imageStoreURL = envOrDefault("ISUREAL_IMAGE_STORE_URL", "http://192.168.4.10")
+	// selfImageRegion はこのサーバーのリージョン。アップロードされた画像の持ち主(origin_region)として記録する
+	selfImageRegion = envOrDefault("ISUREAL_REGION", "asia")
+	// imageOriginHosts はリージョンごとの、ベンチ中に追加された画像を持っているサーバー(プライベートIP)
+	imageOriginHosts = map[string]string{
+		"asia":    envOrDefault("ISUREAL_IMAGE_ORIGIN_ASIA", "192.168.1.10"),
+		"europe":  envOrDefault("ISUREAL_IMAGE_ORIGIN_EUROPE", "192.168.2.10"),
+		"america": envOrDefault("ISUREAL_IMAGE_ORIGIN_AMERICA", "192.168.3.10"),
+	}
 	imageStoreClient  = &http.Client{Timeout: 10 * time.Second}
 	imageIDPattern    = regexp.MustCompile(`^[0-9a-f-]{36}$`)
 	initialBoundary   time.Time
@@ -72,36 +80,71 @@ func imageKind(ctx context.Context, db sqlx.QueryerContext, createdAt time.Time)
 	return imageKindInitial, nil
 }
 
-// putRuntimeImageAsync はベンチ中に追加された画像をisu3へ非同期でPUTし、結果をチャネルで返す。
-// DBのトランザクションとisu3への往復を並行させるために使う。
-func putRuntimeImageAsync(id string, data []byte) <-chan error {
+// storeUploadedImage はアップロードされた画像を保存し、画像を持っているリージョン(origin_region)を返す。
+// 手元に書けたときは、isu3へのPUT(europe/americaでは帯域制限で数百ms)を待たずに返し、PUTは裏で続ける。
+// 他サーバーは origin のサーバー(落ちていればisu3)から取得する。手元に書けなかったときは、
+// 従来どおりisu3へのPUTの完了を待ち、originは空(=isu3から取得)にする。
+func storeUploadedImage(id string, data []byte) (string, error) {
+	put := putRuntimeImageToStore(id, data)
+	if err := writeLocalRuntimeImage(id, data); err != nil {
+		if err := <-put; err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	go func() {
+		if err := <-put; err != nil {
+			fmt.Fprintf(os.Stderr, "failed to put image %s to store: %v\n", id, err)
+		}
+	}()
+	return selfImageRegion, nil
+}
+
+func putRuntimeImageToStore(id string, data []byte) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		done <- storeRequest(http.MethodPut, "/images/"+imageRelPath(imageKindRuntime, id), data)
 	}()
-	// アップロードしたサーバーでは手元にも置いておき、isu3からの取得を省く(失敗してもnginxがisu3から取得する)
-	go writeLocalRuntimeImage(id, data)
 	return done
 }
 
-// writeLocalRuntimeImage は手元のruntimeキャッシュに画像を書く(ベストエフォート)。
+// nullableOrigin は origin_region をDBに書くための値に変換する(空ならNULL)。
+func nullableOrigin(origin string) any {
+	if origin == "" {
+		return nil
+	}
+	return origin
+}
+
+// runtimeImageAccelPath は、ベンチ中に追加された画像をnginxに返させるパスを返す。
+// 別のリージョンのサーバーが持っている画像は、そのサーバーから取得して手元に保存させる。
+func runtimeImageAccelPath(origin, id string) string {
+	if _, ok := imageOriginHosts[origin]; ok && origin != selfImageRegion {
+		return "/_img/runtime-from/" + origin + "/" + id[:2] + "/" + id + ".jpg"
+	}
+	return "/_img/" + imageRelPath(imageKindRuntime, id)
+}
+
+// writeLocalRuntimeImage は手元のruntimeキャッシュに画像を書く。
 // 画像の中身はIDごとに不変で、閲覧可否は配信のたびにDBで確認するため、キャッシュが古くなることはない。
-func writeLocalRuntimeImage(id string, data []byte) {
+func writeLocalRuntimeImage(id string, data []byte) error {
 	path := localImageCacheRoot + "/_img/" + imageRelPath(imageKindRuntime, id)
 	dir := path[:strings.LastIndex(path, "/")]
 	if err := os.MkdirAll(dir, 0o775); err != nil {
-		return
+		return err
 	}
 	// nginx(www-data)もこのディレクトリにproxy_storeで書くため、グループにも書き込みを許す
 	_ = os.Chmod(dir, 0o2775)
 	tmp := path + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		_ = os.Remove(tmp)
-		return
+		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return err
 	}
+	return nil
 }
 
 // resetLocalRuntimeImages は手元のruntimeキャッシュを消す。初期化を止めないよう、
@@ -174,7 +217,24 @@ func readImage(ctx context.Context, kind, id string) ([]byte, error) {
 	if data, err := os.ReadFile(localImageCacheRoot + "/_img/" + rel); err == nil {
 		return data, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageStoreURL+"/_img/"+rel, nil)
+	data, err := fetchImage(ctx, imageStoreURL+"/_img/"+rel)
+	if err == nil || kind != imageKindRuntime {
+		return data, err
+	}
+	// isu3へのPUTがまだ終わっていない画像は、アップロードしたサーバーから取得する
+	for region, host := range imageOriginHosts {
+		if region == selfImageRegion {
+			continue
+		}
+		if data, originErr := fetchImage(ctx, "http://"+host+"/_img_origin/"+rel); originErr == nil {
+			return data, nil
+		}
+	}
+	return nil, err
+}
+
+func fetchImage(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +244,7 @@ func readImage(ctx context.Context, kind, id string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("image store GET %s: status %d", rel, resp.StatusCode)
+		return nil, fmt.Errorf("image GET %s: status %d", url, resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
 }

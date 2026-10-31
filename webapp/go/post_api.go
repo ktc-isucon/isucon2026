@@ -87,11 +87,11 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
+		// 画像本体はこのサーバーの手元に置き(isu3へのPUTは裏で続ける)、ロックを取る前に保存を終える。
+		// 画像の行は、保存に成功したときだけ作る
 		imageID := uuid.NewString()
-		imageStored := putRuntimeImageAsync(imageID, imageData)
-		// 画像のPUT完了は、ロックを取る前(バッチを送る前)に待つ。画像の行は、PUTが成功したときだけ作る
-		if err := <-imageStored; err != nil {
+		imageOrigin, err := storeUploadedImage(imageID, imageData)
+		if err != nil {
 			return err
 		}
 		postedAt := time.Now().UTC()
@@ -122,8 +122,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
             WHERE p.author_id = $2 AND pw.local_date = win.local_date AND p.deleted_at IS NOT NULL) < 2
        AND $10::timestamptz >= win.starts_at
    ), img AS (
-     INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
-     SELECT $3::text, $2::text, ''::bytea, 'image/jpeg', $10::timestamptz FROM ok
+     INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at, origin_region)
+     SELECT $3::text, $2::text, ''::bytea, 'image/jpeg', $10::timestamptz, $11::text FROM ok
    ), p AS (
      INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                         location_kind, latitude, longitude, locality, posted_at)
@@ -132,7 +132,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
    )
    SELECT ` + postColumns + ` FROM p JOIN ok w ON w.id = p.posting_window_id`,
 				args: []any{postID, userID, imageID, input.Caption, input.Visibility,
-					location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt},
+					location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt, nullableOrigin(imageOrigin)},
 				scan: scanFirstRow(created, postScanDest(dest)...),
 			}
 		}
