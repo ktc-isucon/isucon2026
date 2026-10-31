@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -89,70 +90,73 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
 		imageID := uuid.NewString()
 		imageStored := putRuntimeImageAsync(imageID, imageData)
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		// 行ロックとユーザーの取得を1往復にまとめる
-		user, err := lockUser(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		// 画像のPUT完了は投稿期間をロックする前に待ち、ロックを持つ時間を短くする
+		// 画像のPUT完了は、ロックを取る前(バッチを送る前)に待つ。画像の行は、PUTが成功したときだけ作る
 		if err := <-imageStored; err != nil {
 			return err
 		}
-		// 投稿期間のロックと当日の投稿数の確認を1往復にまとめる。
-		// 投稿数は投稿者本人の投稿だけを数えるので、上の行ロックで並行する変更から守られる。
-		// 投稿期間は共有ロック(FOR SHARE)にする。同じリージョンの投稿同士は並行でき、
-		// 投稿期間を終了するUPDATEは実行中の投稿のコミットを待つので、終了済みの期間には投稿されない
-		var window struct {
-			ID        string    `db:"id"`
-			LocalDate time.Time `db:"local_date"`
-			StartsAt  time.Time `db:"starts_at"`
-			Active    int       `db:"active"`
-			Deleted   int       `db:"deleted"`
-		}
-		windowQuery := `
-   SELECT w.id, w.local_date, w.starts_at,
-     (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
-      WHERE p.author_id = $2 AND pw.local_date = w.local_date AND p.deleted_at IS NULL) AS active,
-     (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
-      WHERE p.author_id = $2 AND pw.local_date = w.local_date AND p.deleted_at IS NOT NULL) AS deleted
-   FROM posting_windows w WHERE w.region = $1 AND w.ended_at IS NULL FOR SHARE OF w`
-		err = tx.GetContext(ctx, &window, windowQuery, user.Region, userID)
-		if errors.Is(err, sql.ErrNoRows) {
-			err = tx.GetContext(ctx, &window, windowQuery, user.Region, userID)
-		}
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-			}
-			return err
-		}
 		postedAt := time.Now().UTC()
-		if window.Active != 0 || window.Deleted >= 2 || postedAt.Before(window.StartsAt) {
-			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, ''::bytea, 'image/jpeg', $3)`, imageID, userID, postedAt); err != nil {
-			return err
-		}
-		// INSERT と getPost 相当の読み直しを1往復にまとめる
-		var post Post
-		if err := tx.GetContext(ctx, &post, `
-   WITH p AS (
+		postID := uuid.NewString()
+		// BEGIN〜COMMITを1往復で送る。
+		// 1文目: 投稿者の行ロック(当日の投稿数・削除数を並行する変更から守る)と、応答に使うユーザーの取得
+		// 2文目: 投稿期間の共有ロック(FOR SHARE)、当日の投稿数の確認、画像と投稿の作成を1文で行う。
+		//        条件を満たさないときは何も作らず、0行を返す
+		// 3文目: 2文目の時点で投稿期間がなかった(切り替わり中だった)ときだけ、新しいスナップショットでもう一度試す
+		var user User
+		var userFound, postCreated, retryCreated bool
+		var post, retryPost Post
+		createStmt := func(created *bool, dest *Post) pipelinedStmt {
+			return pipelinedStmt{
+				sql: `
+   WITH win AS (
+     SELECT w.id, w.local_date, w.starts_at, w.on_time_deadline, w.ended_at
+     FROM posting_windows w
+     WHERE w.region = (SELECT region FROM users WHERE id = $2 AND status = 'active')
+       AND w.ended_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM posts WHERE id = $1)
+     FOR SHARE OF w
+   ), ok AS (
+     SELECT win.* FROM win
+     WHERE (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
+            WHERE p.author_id = $2 AND pw.local_date = win.local_date AND p.deleted_at IS NULL) = 0
+       AND (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
+            WHERE p.author_id = $2 AND pw.local_date = win.local_date AND p.deleted_at IS NOT NULL) < 2
+       AND $10::timestamptz >= win.starts_at
+   ), img AS (
+     INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at)
+     SELECT $3::text, $2::text, ''::bytea, 'image/jpeg', $10::timestamptz FROM ok
+   ), p AS (
      INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                         location_kind, latitude, longitude, locality, posted_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     SELECT $1::text, $2::text, ok.id, $3::text, $4::text, $5::text, $6::text, $7::float8, $8::float8, $9::text, $10::timestamptz FROM ok
      RETURNING *
    )
-   SELECT `+postColumns+` FROM p JOIN posting_windows w ON w.id = p.posting_window_id
-  `, uuid.NewString(), userID, window.ID, imageID, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt); err != nil {
+   SELECT ` + postColumns + ` FROM p JOIN ok w ON w.id = p.posting_window_id`,
+				args: []any{postID, userID, imageID, input.Caption, input.Visibility,
+					location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt},
+				scan: scanFirstRow(created, postScanDest(dest)...),
+			}
+		}
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT ` + strings.Join(userColumns, ", ") + ` FROM users WHERE id = $1 AND status = 'active' FOR NO KEY UPDATE`,
+				args: []any{userID},
+				scan: scanFirstRow(&userFound, userScanDest(&user)...),
+			},
+			createStmt(&postCreated, &post),
+			createStmt(&retryCreated, &retryPost),
+		); err != nil {
 			return err
 		}
-		if err := tx.Commit(); err != nil {
+		if !userFound {
+			return sql.ErrNoRows
+		}
+		if !postCreated {
+			if !retryCreated {
+				return NewAPIError(http.StatusConflict, "post_slot_unavailable")
+			}
+			post = retryPost
+		}
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
