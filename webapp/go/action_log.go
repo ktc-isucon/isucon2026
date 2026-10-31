@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/labstack/echo/v5"
 )
@@ -53,9 +54,10 @@ var actionNames = map[string]string{
 	"POST /api/admin/posting-window":                "open_posting_window",
 }
 
-var logLevelRanks = map[string]int{"debug": 0, "info": 1, "error": 2}
+// warn は info と error の間。行動ログに warn の行はないので、warn にすると error(5xx)だけが出る。
+var logLevelRanks = map[string]int{"debug": 0, "info": 1, "warn": 2, "error": 3}
 
-func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc {
+func ActionLogMiddleware(minLevel string, output io.Writer, guard *banGuard) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
 			err := next(c)
@@ -63,6 +65,13 @@ func ActionLogMiddleware(minLevel string, output io.Writer) echo.MiddlewareFunc 
 				c.Echo().HTTPErrorHandler(c, err)
 			}
 			_, status := echo.ResolveResponseStatus(c.Response(), err)
+
+			// 旧 isureal-guard が行動ログから数えていた失敗を、ログの出力レベルに関係なくここで数える
+			if guard != nil {
+				route := c.RouteInfo()
+				abuse, _ := c.Get("abuse").(string)
+				guard.observe(actionNames[route.Method+" "+route.Path], status, c.RealIP(), abuse, time.Now())
+			}
 
 			level := "info"
 			switch {
