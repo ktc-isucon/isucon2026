@@ -130,11 +130,9 @@ func runtimeImageAccelPath(origin, id string) string {
 func writeLocalRuntimeImage(id string, data []byte) error {
 	path := localImageCacheRoot + "/_img/" + imageRelPath(imageKindRuntime, id)
 	dir := path[:strings.LastIndex(path, "/")]
-	if err := os.MkdirAll(dir, 0o775); err != nil {
+	if err := ensureRuntimeCacheDir(dir); err != nil {
 		return err
 	}
-	// nginx(www-data)もこのディレクトリにproxy_storeで書くため、グループにも書き込みを許す
-	_ = os.Chmod(dir, 0o2775)
 	tmp := path + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		_ = os.Remove(tmp)
@@ -143,6 +141,23 @@ func writeLocalRuntimeImage(id string, data []byte) error {
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
+	}
+	return nil
+}
+
+// runtimeCacheDirMode は手元のruntimeキャッシュのディレクトリの権限。
+// アプリ(isucon)とnginx(www-data)の両方が書くキャッシュなので、umaskに関係なく誰でも書けるようにする。
+const runtimeCacheDirMode = 0o2777
+
+// ensureRuntimeCacheDir は runtime/ と、その下の dir までを作り、どちらにも明示的に権限を付ける。
+// MkdirAll は umask の影響を受け、途中のディレクトリ(runtime/)の権限も付け直さないため。
+func ensureRuntimeCacheDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return err
+	}
+	_ = os.Chmod(localRuntimeImageDir, runtimeCacheDirMode)
+	if dir != localRuntimeImageDir {
+		_ = os.Chmod(dir, runtimeCacheDirMode)
 	}
 	return nil
 }
@@ -156,6 +171,10 @@ func resetLocalRuntimeImages() {
 			fmt.Fprintf(os.Stderr, "failed to reset local runtime images: %v\n", err)
 		}
 		return
+	}
+	// nginxが先に保存しに来ても書けるよう、空のruntime/をすぐに同じ権限で作り直す
+	if err := ensureRuntimeCacheDir(localRuntimeImageDir); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to recreate local runtime images: %v\n", err)
 	}
 	go func() {
 		if err := os.RemoveAll(trash); err != nil {
