@@ -34,6 +34,8 @@ func (c *Config) DatabaseDSN() string {
 		User:   url.UserPassword(c.DBUser, c.DBPassword),
 		Host:   net.JoinHostPort(c.DBHost, c.DBPort),
 		Path:   "/" + c.DBName,
+		// DBへの通信はプライベートネットワーク内(ルーター経由)のため、TLSの往復を省く
+		RawQuery: "sslmode=disable",
 	}
 	return u.String()
 }
