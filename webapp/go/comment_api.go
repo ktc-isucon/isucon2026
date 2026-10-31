@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,10 +51,20 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		for _, id := range slices.Compact([]string{min(actor, post.AuthorID), max(actor, post.AuthorID)}) {
-			var lockedID string
-			if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, id); err != nil {
-				return err
+		// 自分と投稿者の行ロックを1往復で取る(ORDER BY id でロック順を固定)。
+		// 応答に使う自分のユーザー情報もここで受け取る
+		ids := slices.Compact([]string{min(actor, post.AuthorID), max(actor, post.AuthorID)})
+		var locked []User
+		if err := tx.SelectContext(ctx, &locked, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE`, ids); err != nil {
+			return err
+		}
+		if len(locked) != len(ids) {
+			return sql.ErrNoRows
+		}
+		var user User
+		for _, u := range locked {
+			if u.ID == actor {
+				user = u
 			}
 		}
 		allowed, err := canComment(ctx, tx, actor, post.ID)
@@ -63,16 +74,15 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
-		id := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO comments(id,post_id,author_id,body,created_at) VALUES($1,$2,$3,$4,clock_timestamp())`, id, post.ID, actor, input.Body); err != nil {
+		var comment Comment
+		if err := tx.GetContext(ctx, &comment, `INSERT INTO comments(id,post_id,author_id,body,created_at) VALUES($1,$2,$3,$4,clock_timestamp()) RETURNING id,post_id,author_id,body,created_at,deleted_at`, uuid.NewString(), post.ID, actor, input.Body); err != nil {
 			return err
 		}
-		comment, err := getComment(ctx, tx, id)
-		if err != nil {
-			return err
+		// 元の getUser と同じく、有効なユーザーでなければエラーにする
+		if user.Status != "active" {
+			return sql.ErrNoRows
 		}
-		user, err := getUser(ctx, tx, actor)
-		if err != nil {
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {

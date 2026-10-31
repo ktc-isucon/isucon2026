@@ -49,10 +49,38 @@ func userColumnsAs(alias, prefix string) string {
 	return strings.Join(columns, ", ")
 }
 
+// prefixedUserColumns は alias.column の形でユーザーの列を並べる(列名はそのまま)
+func prefixedUserColumns(alias string) string {
+	columns := make([]string, len(userColumns))
+	for i, column := range userColumns {
+		columns[i] = alias + "." + column
+	}
+	return strings.Join(columns, ", ")
+}
+
+// splitIDs は string_agg(',') で連結したIDを分割する
+func splitIDs(joined string) []string {
+	if joined == "" {
+		return nil
+	}
+	return strings.Split(joined, ",")
+}
+
 func (user *User) setImageKey() error {
 	key, err := imageSigningKey(user.SecretKeyHash)
 	user.ImageKey = key
 	return err
+}
+
+// lockUser は行ロック(FOR NO KEY UPDATE)と getUser を1往復で行う。
+// 有効でないユーザーは getUser と同じく sql.ErrNoRows になる
+func lockUser(ctx context.Context, db sqlx.QueryerContext, userID string) (User, error) {
+	var user User
+	err := sqlx.GetContext(ctx, db, &user, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = $1 AND status = 'active' FOR NO KEY UPDATE`, userID)
+	if err != nil {
+		return user, err
+	}
+	return user, user.setImageKey()
 }
 
 func getUser(ctx context.Context, db sqlx.QueryerContext, userID string) (User, error) {
