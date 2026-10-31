@@ -3,6 +3,8 @@ package isureal
 import (
 	"context"
 	"net/http"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -83,6 +85,11 @@ func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, st
 	if err != nil {
 		return response, err
 	}
+	if len(posts) > 50 {
+		prewarmPostSignatures(posts[:50])
+	} else {
+		prewarmPostSignatures(posts)
+	}
 	items := make([]memoryPostResponse, 0, len(posts))
 	for _, post := range posts {
 		items = append(items, memoryPostResponse{
@@ -121,6 +128,16 @@ func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, items [
 	if err != nil {
 		return err
 	}
+	var targets imageSignatureTargets
+	perPost := make(map[string]int, len(items))
+	for _, reaction := range reactions {
+		if perPost[reaction.PostID] < 50 {
+			perPost[reaction.PostID]++
+			targets.add(reaction.Reactor, reaction.ImageID)
+			targets.addProfile(reaction.Reactor)
+		}
+	}
+	targets.prewarm()
 	for _, reaction := range reactions {
 		item := itemByPostID[reaction.PostID]
 		if len(item.RealMojis) < 50 {
@@ -136,6 +153,15 @@ func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, items [
 	if err != nil {
 		return err
 	}
+	targets = imageSignatureTargets{}
+	clear(perPost)
+	for _, comment := range comments {
+		if perPost[comment.PostID] < 50 {
+			perPost[comment.PostID]++
+			targets.addProfile(comment.Author)
+		}
+	}
+	targets.prewarm()
 	for _, comment := range comments {
 		item := itemByPostID[comment.PostID]
 		if len(item.Comments) < 50 {
@@ -143,4 +169,73 @@ func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, items [
 		}
 	}
 	return nil
+}
+
+// imageSignatureTargets は、応答の組み立てで signedImageURL が計算する署名の (鍵, 画像ID) を重複なく集める。
+// prewarm で並列に計算してメモ(imageSignature)に入れておくと、そのあとの組み立てはメモに当たる。
+type imageSignatureTargets struct {
+	seen    map[string]struct{}
+	targets []imageSignatureTarget
+}
+
+type imageSignatureTarget struct {
+	key     []byte
+	imageID string
+}
+
+func (t *imageSignatureTargets) add(owner User, imageID string) {
+	if t.seen == nil {
+		t.seen = make(map[string]struct{})
+	}
+	k := string(owner.ImageKey) + "\x00" + imageID
+	if _, ok := t.seen[k]; ok {
+		return
+	}
+	t.seen[k] = struct{}{}
+	t.targets = append(t.targets, imageSignatureTarget{key: owner.ImageKey, imageID: imageID})
+}
+
+func (t *imageSignatureTargets) addProfile(user User) {
+	if user.ProfileImageID != nil {
+		t.add(user, *user.ProfileImageID)
+	}
+}
+
+// prewarm は signedImageURL と同じ exp で署名を GOMAXPROCS 並列で計算する。
+// 途中で exp の切り替わり(60秒単位)をまたぐと組み立て時にメモが外れるが、その分を直接計算するだけで結果は変わらない。
+func (t *imageSignatureTargets) prewarm() {
+	if len(t.targets) < 2 {
+		return
+	}
+	exp := time.Now().Add(imageURLLifetime).Unix()
+	if r := exp % imageURLExpGranularity; r != 0 {
+		exp += imageURLExpGranularity - r
+	}
+	workers := min(runtime.GOMAXPROCS(0), len(t.targets))
+	ch := make(chan imageSignatureTarget)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for target := range ch {
+				imageSignature(target.key, target.imageID, exp)
+			}
+		}()
+	}
+	for _, target := range t.targets {
+		ch <- target
+	}
+	close(ch)
+	wg.Wait()
+}
+
+// prewarmPostSignatures は投稿の画像と作者のプロフィール画像の署名を温める。
+func prewarmPostSignatures(posts []PostWithAuthor) {
+	var targets imageSignatureTargets
+	for _, post := range posts {
+		targets.add(post.Author, post.ImageID)
+		targets.addProfile(post.Author)
+	}
+	targets.prewarm()
 }

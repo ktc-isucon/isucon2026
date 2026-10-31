@@ -43,6 +43,16 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		images := make([][]byte, len(posts))
 		var eg errgroup.Group
 		eg.SetLimit(16)
+		// 画像の取得(I/O待ち)と並行して、manifestに載せる署名(CPU)をメモに温めておく
+		eg.Go(func() error {
+			var targets imageSignatureTargets
+			for _, post := range posts {
+				targets.add(author, post.ImageID)
+			}
+			targets.addProfile(author)
+			targets.prewarm()
+			return nil
+		})
 		for i, post := range posts {
 			eg.Go(func() error {
 				kind, err := imageKind(ctx, h.DB, post.ImageCreatedAt)
