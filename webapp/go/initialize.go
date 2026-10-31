@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -22,6 +23,15 @@ func initializeHandler(*HandlerContext) echo.HandlerFunc {
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return err
+		}
+
+		// pproteinに計測開始を通知する(PPROTEIN_URL例: http://192.168.0.100:9000)
+		if pproteinURL := os.Getenv("PPROTEIN_URL"); pproteinURL != "" {
+			go func() {
+				if _, err := http.Get(pproteinURL + "/api/group/collect"); err != nil {
+					log.Printf("failed to communicate with pprotein: %v", err)
+				}
+			}()
 		}
 
 		// Set language to the implementation language.

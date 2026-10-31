@@ -1,0 +1,13 @@
+[Unit]
+Description=Convert PostgreSQL jsonlog to MySQL slow query log format
+After=postgresql.service
+
+[Service]
+User=postgres
+Group=postgres
+ExecStart=/bin/bash -c 'tail -n0 -F /var/log/postgresql/postgresql-slow.json | perl /home/isucon/scripts/pg2slowlog.pl >> /var/log/postgresql/postgresql-slow-mysql.log'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

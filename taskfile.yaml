@@ -22,6 +22,8 @@ vars:
   ACCESS_LOG_FILE: "/var/log/nginx/access.log"
   SLOW_QUERY_LOG_FILE: "/var/log/mysql/mysql-slow.log"
   TRUNCATE_LOG_FILE: "{{.ACCESS_LOG_FILE}} {{.SLOW_QUERY_LOG_FILE}}"
+  PG_SERVER_NAME: isu3
+  PG_SLOW_QUERY_LOG_FILE: "/var/log/postgresql/postgresql-slow.json"
 
   SSH_REPOSITORY_URL: "ssh://github.com/{{ .REPOSITORY_NAME }}.git"
   ALL_SERVER_NAMES:
@@ -114,14 +116,17 @@ tasks:
                 \"Label\": \"isu$i\",
                 \"URL\": \"http://${SERVER_ADDRESSES[$i]}/debug/log/httplog\",
                 \"Duration\": 90
-              },
-              {
-                \"Type\": \"slowlog\",
-                \"Label\": \"isu$i\",
-                \"URL\": \"http://${SERVER_ADDRESSES[$i]}/debug/log/slowlog\",
-                \"Duration\": 90
               },"
           done
+          # slowlogはDBサーバのpprotein-agentから取得する
+          pg_index={{trimPrefix "isu" .PG_SERVER_NAME}}
+          json+="
+              {
+                \"Type\": \"slowlog\",
+                \"Label\": \"{{.PG_SERVER_NAME}}\",
+                \"URL\": \"http://${SERVER_ADDRESSES[$pg_index]}:19000/debug/log/slowlog\",
+                \"Duration\": 90
+              },"
           json="[${json%,}
           ]"
           echo "$json"
@@ -591,6 +596,7 @@ tasks:
             $ssht "sudo chmod o+rw $log_file"
             $ssht "truncate -s 0 $log_file"
           done
+      - cmd: ssh {{.PG_SERVER_NAME}} "sudo truncate -s 0 {{.PG_SLOW_QUERY_LOG_FILE}}"
 
   summary:log:
     desc: "ログを集計し、結果をGitHub Issueに記載します(pproteinを使用してない場合で、ベンチマーク実行後に使用)"
@@ -623,6 +629,11 @@ tasks:
           gh issue create -t "計測結果 スコア: 点 $(date '+%Y-%m-%d %H:%M:%S')" -b "$issue_body"
     env:
       LR: "\n"
+
+  summary:log:pg:
+    desc: "PostgreSQLのログをpt-query-digestで集計し標準出力に出力します(ベンチマーク実行後に使用)"
+    cmds:
+      - cmd: ssh {{.PG_SERVER_NAME}} "sudo perl - {{.PG_SLOW_QUERY_LOG_FILE}} | pt-query-digest" < scripts/pg2slowlog.pl
 
   summary:log:alp:
     desc: "alpの結果を集計し標準出力に出力します(alp.ymlの設定調整用に使用)"

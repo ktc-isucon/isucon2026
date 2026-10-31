@@ -16,6 +16,10 @@ targets:
     sudo: true
   - path: /etc/systemd/system/isureal-go.service
     sudo: true
+  - path: /etc/systemd/system/pg2slowlog.service
+    sudo: true
+  - path: /etc/systemd/system/pprotein-agent.service
+    sudo: true
   - path: /usr/lib/systemd/system/postgresql.service
     sudo: true
   - path: /usr/lib/systemd/system/nginx.service
