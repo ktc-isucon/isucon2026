@@ -3,6 +3,7 @@ remote:
     - host: isu0
     - host: isu1
     - host: isu2
+    - host: isu3
   user: isucon
 local:
   config_root_path: ../etc
@@ -18,6 +19,10 @@ targets:
   - path: /usr/lib/systemd/system/postgresql.service
     sudo: true
   - path: /usr/lib/systemd/system/nginx.service
+    sudo: true
+  - path: /etc/postgresql/16/main/postgresql.conf
+    sudo: true
+  - path: /etc/postgresql/16/main/pg_hba.conf
     sudo: true
   - path: /etc/ssh/sshd_config
     sudo: true
