@@ -280,7 +280,7 @@ func (t *imageSignatureTargets) prewarm() {
 		go func() {
 			defer wg.Done()
 			for target := range ch {
-				imageSignature(target.key, target.imageID, exp)
+				imageSignatureForURL(target.key, target.imageID, exp)
 			}
 		}()
 	}
