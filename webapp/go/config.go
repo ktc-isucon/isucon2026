@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 )
 
 type Config struct {
@@ -18,6 +19,9 @@ type Config struct {
 	// 読み取り用の手元のレプリカ。空なら使わない(従来どおりprimaryだけで動く)
 	ReplicaDBHost string
 	ReplicaDBPort string
+
+	// DB接続プールの上限(既定30)
+	DBMaxConns int
 }
 
 func ConfigFromEnv() *Config {
@@ -32,6 +36,8 @@ func ConfigFromEnv() *Config {
 
 		ReplicaDBHost: os.Getenv("ISUREAL_REPLICA_DB_HOST"),
 		ReplicaDBPort: envOrDefault("ISUREAL_REPLICA_DB_PORT", "5432"),
+
+		DBMaxConns: envIntOrDefault("ISUREAL_DB_MAX_CONNS", 30),
 	}
 }
 
@@ -63,6 +69,13 @@ func (c *Config) dsn(host, port string) string {
 func envOrDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+func envIntOrDefault(key string, defaultValue int) int {
+	if n, err := strconv.Atoi(os.Getenv(key)); err == nil && n > 0 {
+		return n
 	}
 	return defaultValue
 }

@@ -13,6 +13,8 @@ Environment=GOGC=400
 Environment=GOMEMLIMIT=2GiB
 # 行動ログはIP BANの判定に使わなくなった(アプリ内で判定する)ので、journaldには5xxだけを書く
 Environment=ISUREAL_LOG_LEVEL=warn
+# DB接続プールの上限(全サーバーの合計がPostgreSQLのmax_connections=200に収まるように: 80+40+40+LISTEN)
+Environment=ISUREAL_DB_MAX_CONNS=80
 WorkingDirectory=/home/isucon/webapp/go
 EnvironmentFile=/home/isucon/env.sh
 ExecStart=/home/isucon/webapp/go/isureal

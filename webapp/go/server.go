@@ -37,9 +37,11 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	db.SetMaxOpenConns(30)
+	// 接続の上限はサーバーごとに ISUREAL_DB_MAX_CONNS で決める(asia は負荷が大きく、30本では空き待ちが多発した)。
+	// 全サーバーの合計 + LISTEN 用の接続が PostgreSQL の max_connections を超えないこと
+	db.SetMaxOpenConns(config.DBMaxConns)
 	// 空き接続を閉じると、europe/americaでは再接続(TCP+TLS+認証)に約5往復(約0.5秒)かかるため保持する
-	db.SetMaxIdleConns(30)
+	db.SetMaxIdleConns(config.DBMaxConns)
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
