@@ -35,6 +35,8 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to open database: " + err.Error())
 	}
 	db.SetMaxOpenConns(30)
+	// 空き接続を閉じると、europe/americaでは再接続(TCP+TLS+認証)に約5往復(約0.5秒)かかるため保持する
+	db.SetMaxIdleConns(30)
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())

@@ -1,17 +1,25 @@
 #!/bin/bash
-# isu3上で実行する。初期データの画像(initial_data_boundary以前)をDBから
-# /home/isucon/images/initial/<id先頭2文字>/<id>.jpg に書き出す(約183万件・13GB)。
+# 初期データの画像(initial_data_boundary以前)を、このサーバーのDBから
+# $IMAGE_ROOT/initial/<id先頭2文字>/<id>.jpg に書き出す(約183万件・13GB)。
 # 既に書き出したファイルは飛ばすので、途中で止めても再実行できる。
-# usage: bash /home/isucon/scripts/export_images.sh
+# usage:
+#   isu3(画像の置き場所):       bash /home/isucon/scripts/export_images.sh
+#   isu0〜2(nginxのキャッシュ): bash /home/isucon/scripts/export_images_local.sh
 set -euo pipefail
 
-IMAGE_ROOT=/home/isucon/images
+IMAGE_ROOT=${IMAGE_ROOT:-/home/isucon/images}
+# isu3ではアプリがPUT/DELETEする runtime/ も用意する
+WITH_RUNTIME=${WITH_RUNTIME:-1}
 DB_NAME=${ISUREAL_DB_NAME:-isureal}
 
-# nginx(www-data)がPUT/DELETE/読み出しできるようにする
-sudo mkdir -p "$IMAGE_ROOT/initial" "$IMAGE_ROOT/runtime"
-sudo chown www-data:www-data "$IMAGE_ROOT" "$IMAGE_ROOT/initial" "$IMAGE_ROOT/runtime"
-sudo chmod 755 "$IMAGE_ROOT" "$IMAGE_ROOT/initial" "$IMAGE_ROOT/runtime"
+# nginx(www-data)が読み書きできるようにする
+dirs=("$IMAGE_ROOT" "$IMAGE_ROOT/initial")
+if [ "$WITH_RUNTIME" = 1 ]; then
+  dirs+=("$IMAGE_ROOT/runtime")
+fi
+sudo mkdir -p "${dirs[@]}"
+sudo chown www-data:www-data "${dirs[@]}"
+sudo chmod 755 "${dirs[@]}"
 
 sudo -u postgres psql --no-psqlrc -d "$DB_NAME" -c "
   COPY (
