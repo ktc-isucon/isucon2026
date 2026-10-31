@@ -34,21 +34,29 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := controller.Flush(); err != nil {
 			return nil
 		}
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
+		// 接続ごとのポーリングはせず、サーバーで1本の監視(notificationWatcher)から
+		// 投稿期間の変化とユーザーの無効化を受け取る
+		subscriber := h.Notifications.subscribe(userID, session.Region)
+		defer h.Notifications.unsubscribe(subscriber)
+		first := true
 		for {
-			user, err := getUser(ctx, h.DB, userID)
-			if err != nil {
-				if !errors.Is(err, sql.ErrNoRows) && ctx.Err() == nil {
-					c.Logger().Error("failed to get notification recipient", "error", err)
+			// 通知を確認する前に取得し、確認後に開いた投稿期間を取りこぼさない
+			changed := h.Notifications.changes(session.Region)
+			if first {
+				first = false
+				user, err := getUser(ctx, h.DB, userID)
+				if err != nil {
+					if !errors.Is(err, sql.ErrNoRows) && ctx.Err() == nil {
+						c.Logger().Error("failed to get notification recipient", "error", err)
+					}
+					return nil
 				}
-				return nil
-			}
-			if user.Region != session.Region {
-				return nil
+				if user.Region != session.Region {
+					return nil
+				}
 			}
 			var notification getNotificationsResponse
-			err = h.DB.GetContext(ctx, &notification, `
+			err := h.DB.GetContext(ctx, &notification, `
     SELECT n.id, n.posting_window_id, w.region, n.created_at
     FROM notifications n JOIN posting_windows w ON w.id = n.posting_window_id
     WHERE n.user_id = $1 AND n.created_at > $2 AND w.ended_at IS NULL
@@ -75,7 +83,9 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-ticker.C:
+			case <-subscriber.gone:
+				return nil
+			case <-changed:
 			}
 		}
 	}
