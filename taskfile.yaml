@@ -432,7 +432,10 @@ tasks:
     cmds:
       - for: { var: SERVER_NAMES, as: SERVER_NAME }
         cmd: |
-          if [ "{{.SERVER_NAME}}" = "{{.PG_SERVER_NAME}}" ]; then
+          if [ "{{.SERVER_NAME}}" = "{{.PG_SERVER_NAME}}" ] && ssh {{.USER_NAME}}@{{.SERVER_NAME}} "test -e /home/isucon/.final_mode"; then
+            # 最終計測モード(scripts/final_mode.sh on)では pprotein を起動しない
+            echo "Skip restart pprotein on {{.SERVER_NAME}} (final mode)"
+          elif [ "{{.SERVER_NAME}}" = "{{.PG_SERVER_NAME}}" ]; then
             ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
             $ssht "test -x /home/isucon/go/bin/pprotein-agent || {{.SERVER_GO_BIN_DIR}}/go install github.com/kaz/pprotein/cli/pprotein-agent@latest"
             $ssht "sudo systemctl daemon-reload"
@@ -443,6 +446,21 @@ tasks:
           fi
     vars:
       SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .PG_SERVER_NAME }}"
+
+  final:on:
+    desc: "最終計測用に計測用のログ・プロファイラを止めます(push:all のあとはもう一度実行すること)"
+    cmds:
+      - bash scripts/final_mode.sh on
+
+  final:off:
+    desc: "最終計測モードを解除し、計測用のログ・プロファイラを元に戻します"
+    cmds:
+      - bash scripts/final_mode.sh off
+
+  final:status:
+    desc: "最終計測モードの状態を表示します"
+    cmds:
+      - bash scripts/final_mode.sh status
 
   restart:mysql:
     desc: "mysqlを再起動します(サーバ指定なしの場合、全サーバが対象)"
