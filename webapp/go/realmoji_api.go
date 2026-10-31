@@ -75,6 +75,9 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if actor == post.AuthorID {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
 		}
+		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
+		imageID := uuid.NewString()
+		imageStored := putRuntimeImageAsync(imageID, data)
 		tx, err := beginRelationshipTx(ctx, h.DB, actor, post.AuthorID)
 		if err != nil {
 			return err
@@ -90,8 +93,10 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL`, post.ID, actor); err != nil {
 			return err
 		}
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,$3,'image/jpeg')`, imageID, actor, data); err != nil {
+		if err := <-imageStored; err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,''::bytea,'image/jpeg')`, imageID, actor); err != nil {
 			return err
 		}
 		id := uuid.NewString()

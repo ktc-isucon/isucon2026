@@ -24,6 +24,10 @@ func initializeHandler(*HandlerContext) echo.HandlerFunc {
 		if err := cmd.Run(); err != nil {
 			return err
 		}
+		// ベンチ中に追加された画像(isu3のruntime/)を消す
+		if err := resetRuntimeImages(); err != nil {
+			log.Printf("failed to reset runtime images: %v", err)
+		}
 
 		// pproteinに計測開始を通知する(PPROTEIN_URL例: http://192.168.0.100:9000)
 		if pproteinURL := os.Getenv("PPROTEIN_URL"); pproteinURL != "" {

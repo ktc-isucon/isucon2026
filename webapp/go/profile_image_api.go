@@ -7,6 +7,7 @@ import (
 	"image/jpeg"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
@@ -32,6 +33,9 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
+		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
+		imageID := uuid.NewString()
+		imageStored := putRuntimeImageAsync(imageID, data)
 		tx, err := h.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
@@ -44,20 +48,28 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			return err
 		}
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES ($1,$2,$3,'image/jpeg')`, imageID, userID, data); err != nil {
+		if err := <-imageStored; err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES ($1,$2,''::bytea,'image/jpeg')`, imageID, userID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=$2,updated_at=clock_timestamp() WHERE id=$1`, userID, imageID); err != nil {
 			return err
 		}
+		var oldCreatedAt []time.Time
 		if oldID != nil {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM image_objects WHERE id=$1`, *oldID); err != nil {
+			if err := tx.SelectContext(ctx, &oldCreatedAt, `DELETE FROM image_objects WHERE id=$1 RETURNING created_at`, *oldID); err != nil {
 				return err
 			}
 		}
 		if err := tx.Commit(); err != nil {
 			return err
+		}
+		for _, createdAt := range oldCreatedAt {
+			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
+				deleteRuntimeImage(kind, *oldID)
+			}
 		}
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -86,11 +98,17 @@ func deleteProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=NULL,updated_at=clock_timestamp() WHERE id=$1`, userID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM image_objects WHERE id=$1`, *imageID); err != nil {
+		var deletedCreatedAt []time.Time
+		if err := tx.SelectContext(ctx, &deletedCreatedAt, `DELETE FROM image_objects WHERE id=$1 RETURNING created_at`, *imageID); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
+		}
+		for _, createdAt := range deletedCreatedAt {
+			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
+				deleteRuntimeImage(kind, *imageID)
+			}
 		}
 		return c.NoContent(http.StatusNoContent)
 	}
