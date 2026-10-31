@@ -21,7 +21,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		author, err := getUser(ctx, h.DB, userID)
+		author, err := getUser(ctx, h.ReadDB(c), userID)
 		if err != nil {
 			return err
 		}
@@ -29,7 +29,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 			Post
 			ImageCreatedAt time.Time `db:"image_created_at"`
 		}
-		if err := h.DB.SelectContext(ctx, &posts, `
+		if err := h.ReadDB(c).SelectContext(ctx, &posts, `
    SELECT `+postColumns+`, i.created_at AS image_created_at
    FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
@@ -45,7 +45,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		eg.SetLimit(16)
 		for i, post := range posts {
 			eg.Go(func() error {
-				kind, err := imageKind(ctx, h.DB, post.ImageCreatedAt)
+				kind, err := imageKind(ctx, h.ReadDB(c), post.ImageCreatedAt)
 				if err != nil {
 					return err
 				}

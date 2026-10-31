@@ -185,7 +185,7 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 		userID := GetSession(c).UserID
 		// 投稿IDの特定・投稿・投稿者の取得を1往復にまとめる
 		var post PostWithAuthor
-		err := h.DB.GetContext(ctx, &post, `
+		err := h.ReadDB(c).GetContext(ctx, &post, `
    SELECT `+postColumns+`, `+userColumnsAs("u", "author")+` FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
    JOIN users u ON u.id = p.author_id AND u.status = 'active'
@@ -219,14 +219,14 @@ func getPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		ctx := c.Request().Context()
-		post, err := getPostWithAuthor(ctx, h.DB, input.PostID)
+		post, err := getPostWithAuthor(ctx, h.ReadDB(c), input.PostID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		viewer, err := loadViewerContext(ctx, h.DB, GetSession(c).UserID)
+		viewer, err := loadViewerContext(ctx, h.ReadDB(c), GetSession(c).UserID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}

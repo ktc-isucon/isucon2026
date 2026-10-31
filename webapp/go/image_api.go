@@ -52,7 +52,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			CreatedAt     time.Time `db:"created_at"`
 			Visible       bool      `db:"visible"`
 		}
-		err = h.DB.GetContext(ctx, &object, `
+		err = h.ReadDB(c).GetContext(ctx, &object, `
    SELECT u.secret_key_hash, i.created_at, (
      u.profile_image_id IS NOT DISTINCT FROM i.id
      OR EXISTS (
@@ -89,7 +89,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		kind, err := imageKind(ctx, h.DB, object.CreatedAt)
+		kind, err := imageKind(ctx, h.ReadDB(c), object.CreatedAt)
 		if err != nil {
 			return err
 		}
