@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/labstack/echo/v5"
@@ -37,6 +38,11 @@ func APIErrorHandler(c *echo.Context, err error) {
 	}
 	if status >= http.StatusInternalServerError {
 		c.Logger().Error("request failed", "error", err)
+	}
+	// 本文を読まずに返して接続を閉じると、アップロード中のnginxが502にしてしまう(IP BANの403など)。
+	// 上限つきで読み捨ててからエラーを返す
+	if req := c.Request(); req.Body != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 32<<20))
 	}
 	body := APIErrorResponse{
 		Error: message,
