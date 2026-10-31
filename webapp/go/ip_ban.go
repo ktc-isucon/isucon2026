@@ -17,6 +17,47 @@ const ipBanReloadInterval = 200 * time.Millisecond
 type IPBanList struct {
 	reloading sync.Mutex
 	snapshot  atomic.Pointer[ipBanSnapshot]
+
+	// このサーバーで BAN して、まだ DB から読み直せていないかもしれない分(reloading で保護)
+	local map[string]time.Time
+}
+
+// addLocal は、このサーバーで BAN した IP をすぐにスナップショットへ反映する。
+// DB への書き込みより前の Reload で消えないよう、期限まで local にも残して読み直しのたびに足す。
+func (l *IPBanList) addLocal(ip string, until time.Time) {
+	l.reloading.Lock()
+	defer l.reloading.Unlock()
+	if l.local == nil {
+		l.local = make(map[string]time.Time)
+	}
+	if until.After(l.local[ip]) {
+		l.local[ip] = until
+	}
+	current := l.snapshot.Load()
+	bans := make(map[string]time.Time)
+	if current != nil {
+		for k, v := range current.bans {
+			bans[k] = v
+		}
+	}
+	if until.After(bans[ip]) {
+		bans[ip] = until
+	}
+	l.snapshot.Store(&ipBanSnapshot{loadedAt: time.Now(), bans: bans})
+}
+
+// dropLocal は、DB に書けた BAN の控えを捨てる。スナップショットにはそのまま残し、次の読み直しで DB の値に置き換わる。
+func (l *IPBanList) dropLocal(ip string) {
+	l.reloading.Lock()
+	delete(l.local, ip)
+	l.reloading.Unlock()
+}
+
+// resetLocal は、初期化(ip_bans の TRUNCATE)のときに、このサーバーの BAN の控えを捨てる。
+func (l *IPBanList) resetLocal() {
+	l.reloading.Lock()
+	l.local = nil
+	l.reloading.Unlock()
 }
 
 type ipBanSnapshot struct {
@@ -29,7 +70,7 @@ type ipBan struct {
 	BannedUntil time.Time `db:"banned_until"`
 }
 
-// Runは、isureal-guardがip_bansに書いたBANを ipBanReloadInterval ごとに裏で読み直す。
+// Runは、ip_bansに書かれたBAN(他サーバーのアプリが書いたものを含む)を ipBanReloadInterval ごとに裏で読み直す。
 // リクエストはメモリ上のスナップショットを見るだけなので、読み直しのDB往復を待たない。
 func (l *IPBanList) Run(ctx context.Context, db *sqlx.DB) {
 	ticker := time.NewTicker(ipBanReloadInterval)
@@ -53,6 +94,16 @@ func (l *IPBanList) Reload(ctx context.Context, db *sqlx.DB) error {
 	loaded, err := loadIPBans(ctx, db)
 	if err != nil {
 		return err
+	}
+	now := time.Now()
+	for ip, until := range l.local {
+		if !now.Before(until) {
+			delete(l.local, ip)
+			continue
+		}
+		if until.After(loaded.bans[ip]) {
+			loaded.bans[ip] = until
+		}
 	}
 	l.snapshot.Store(loaded)
 	return nil

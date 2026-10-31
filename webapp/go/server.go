@@ -28,7 +28,8 @@ func NewServer(config *Config) *echo.Echo {
 	e := echo.New()
 	e.IPExtractor = extractClientIP
 
-	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout))
+	guard := newBanGuardFromEnv()
+	e.Use(ActionLogMiddleware(config.LogLevel, os.Stdout, guard))
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
@@ -63,6 +64,7 @@ func NewServer(config *Config) *echo.Echo {
 		e.Logger.Error("failed to load ip bans", "error", err)
 	}
 	go handlerContext.IPBans.Run(context.Background(), db)
+	guard.attach(context.Background(), db, handlerContext.IPBans)
 	e.Use(IPBanMiddleware(handlerContext))
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))

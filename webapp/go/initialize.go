@@ -24,7 +24,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := cmd.Run(); err != nil {
 			return err
 		}
-		// ip_bansはTRUNCATEされたので、古いBANが残らないようすぐに読み直す
+		// ip_bansはTRUNCATEされたので、古いBANが残らないようすぐに読み直す(このサーバーで書き込み待ちの控えも捨てる)
+		h.IPBans.resetLocal()
 		if err := h.IPBans.Reload(c.Request().Context(), h.DB); err != nil {
 			return err
 		}
