@@ -17,6 +17,10 @@ while (my $line = <>) {
     next unless $message =~ /\Aduration: ([\d.]+) ms\s+(?:statement|execute [^:]*): (.*)\z/s;
     my ($duration_ms, $query) = ($1, $2);
 
+    # slp(pprotein)はMySQLの構文でパースし、失敗したクエリを捨てるためPostgreSQL固有の構文を寄せる
+    $query =~ s/\$\d+/?/g;                       # $1 -> ?
+    $query =~ s/::\w+(?:\s+precision)?(?:\[\])?//g; # ::timestamptz などのキャストを除去
+    $query =~ s/\bFOR NO KEY UPDATE\b/FOR UPDATE/gi;
     $query =~ s/\s*;?\s*\z/;/;
 
     my $ts = $log->{timestamp} // '';
