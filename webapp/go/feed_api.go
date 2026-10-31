@@ -137,46 +137,39 @@ func recommendationScores(ctx context.Context, db sqlx.QueryerContext, viewer vi
 		postIDs = append(postIDs, post.ID)
 	}
 
-	query, args, err := sqlx.In(`SELECT user_low_id, user_high_id FROM friendships WHERE user_low_id IN (?) OR user_high_id IN (?)`, authorIDs, authorIDs)
+	// 投稿者の友達関係(kind='f')と投稿への反応(kind='e')を1往復で取得する
+	query, args, err := sqlx.In(`
+  SELECT 'f' AS kind, user_low_id AS a, user_high_id AS b FROM friendships WHERE user_low_id IN (?) OR user_high_id IN (?)
+  UNION ALL
+  SELECT 'e', post_id, user_id FROM (
+    SELECT r.post_id, r.reactor_id AS user_id FROM realmojis r
+    JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
+    WHERE r.post_id IN (?) AND r.replaced_at IS NULL AND r.deleted_at IS NULL
+    UNION
+    SELECT c.post_id, c.author_id AS user_id FROM comments c
+    JOIN users u ON u.id = c.author_id AND u.status = 'active'
+    WHERE c.post_id IN (?) AND c.deleted_at IS NULL
+  ) engagements
+ `, authorIDs, authorIDs, postIDs, postIDs)
 	if err != nil {
 		return nil, err
 	}
-	var friendships []struct {
-		UserLowID  string `db:"user_low_id"`
-		UserHighID string `db:"user_high_id"`
+	var rows []struct {
+		Kind string `db:"kind"`
+		A    string `db:"a"`
+		B    string `db:"b"`
 	}
-	if err := sqlx.SelectContext(ctx, db, &friendships, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
+	if err := sqlx.SelectContext(ctx, db, &rows, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
 		return nil, err
 	}
 	connections := map[string]int64{}
-	for _, friendship := range friendships {
-		connections[friendship.UserLowID] += int64(viewer.MutualFriends[friendship.UserHighID])
-		connections[friendship.UserHighID] += int64(viewer.MutualFriends[friendship.UserLowID])
-	}
-
-	query, args, err = sqlx.In(`
-  SELECT r.post_id, r.reactor_id AS user_id FROM realmojis r
-  JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
-  WHERE r.post_id IN (?) AND r.replaced_at IS NULL AND r.deleted_at IS NULL
-  UNION
-  SELECT c.post_id, c.author_id AS user_id FROM comments c
-  JOIN users u ON u.id = c.author_id AND u.status = 'active'
-  WHERE c.post_id IN (?) AND c.deleted_at IS NULL
- `, postIDs, postIDs)
-	if err != nil {
-		return nil, err
-	}
-	var engagements []struct {
-		PostID string `db:"post_id"`
-		UserID string `db:"user_id"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &engagements, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
-		return nil, err
-	}
 	friendEngagements := map[string]int64{}
-	for _, engagement := range engagements {
-		if viewer.Friends[engagement.UserID] {
-			friendEngagements[engagement.PostID]++
+	for _, row := range rows {
+		if row.Kind == "f" {
+			connections[row.A] += int64(viewer.MutualFriends[row.B])
+			connections[row.B] += int64(viewer.MutualFriends[row.A])
+		} else if viewer.Friends[row.B] {
+			friendEngagements[row.A]++
 		}
 	}
 
