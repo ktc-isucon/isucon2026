@@ -41,3 +41,10 @@ INSERT INTO block_relations (id, blocker_id, blocked_id, created_at)
 SELECT id, blocker_id, blocked_id, created_at FROM initial_block_relations;
 
 COMMIT;
+
+-- 高速化のためのインデックス(初回のみ作成され、2回目以降はすぐ終わる)
+CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username);
+CREATE INDEX IF NOT EXISTS posts_image_id ON posts(image_id);
+CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis(image_id);
+CREATE INDEX IF NOT EXISTS friendships_user_high_id ON friendships(user_high_id);
+CREATE INDEX IF NOT EXISTS notifications_user_id_created_at ON notifications(user_id, created_at);

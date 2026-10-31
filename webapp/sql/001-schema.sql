@@ -83,6 +83,7 @@ CREATE TABLE users (
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 ALTER TABLE image_objects ADD CONSTRAINT image_objects_owner_fk FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE RESTRICT;
+CREATE UNIQUE INDEX users_username ON users(username);
 
 -- 2026-09-10 管理者を消す時のオペレーションはどうすればよいですか？
 -- 2026-09-13 消すことは想定されていません
@@ -121,6 +122,7 @@ CREATE TABLE friendships (
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   UNIQUE(user_low_id,user_high_id)
 );
+CREATE INDEX friendships_user_high_id ON friendships(user_high_id);
 
 CREATE TABLE follows (
   id varchar(36) PRIMARY KEY,
@@ -168,6 +170,7 @@ CREATE TABLE posts (
 );
 CREATE INDEX posts_author_id ON posts(author_id);
 CREATE INDEX posts_posting_window_id ON posts(posting_window_id);
+CREATE INDEX posts_image_id ON posts(image_id);
 
 CREATE TABLE friend_requests (
   id varchar(36) PRIMARY KEY,
@@ -190,6 +193,7 @@ CREATE TABLE realmojis (
 );
 CREATE UNIQUE INDEX realmojis_one_active ON realmojis(post_id,reactor_id) WHERE replaced_at IS NULL AND deleted_at IS NULL;
 CREATE INDEX realmojis_post_id ON realmojis(post_id);
+CREATE INDEX realmojis_image_id ON realmojis(image_id);
 
 CREATE TABLE comments (
   id varchar(36) PRIMARY KEY,
@@ -208,6 +212,7 @@ CREATE TABLE notifications (
   created_at timestamptz NOT NULL,
   UNIQUE(user_id,posting_window_id)
 );
+CREATE INDEX notifications_user_id_created_at ON notifications(user_id, created_at);
 
 CREATE TABLE ip_bans (
   ip text PRIMARY KEY,
