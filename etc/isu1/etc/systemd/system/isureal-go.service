@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 User=isucon
 Group=isucon
+# pproteinでnginxのaccess.log(www-data:adm 0640)を読むため
+SupplementaryGroups=adm
 WorkingDirectory=/home/isucon/webapp/go
 EnvironmentFile=/home/isucon/env.sh
 ExecStart=/home/isucon/webapp/go/isureal
