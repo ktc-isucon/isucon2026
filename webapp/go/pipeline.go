@@ -143,6 +143,14 @@ func postInteractionAllowedSQL(viewer, post string, forComment bool) string {
   )`
 }
 
+// scanExists は行があったかだけを found に入れる(列は読まない)。
+func scanExists(found *bool) func(pgx.Rows) error {
+	return func(rows pgx.Rows) error {
+		*found = rows.Next()
+		return nil
+	}
+}
+
 // scanFirstRow は最初の1行だけを dest に読み、行があったかを found に入れる。
 func scanFirstRow(found *bool, dest ...any) func(pgx.Rows) error {
 	return func(rows pgx.Rows) error {

@@ -12,30 +12,24 @@ func deleteAccountHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var lockedID string
-		err = tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 AND status='active' FOR NO KEY UPDATE`, userID)
+		// 退会・セッションの無効化・全サーバーへの通知を1文(1往復)で行う。
+		// users の UPDATE が行ロックを取るので、前の実装の SELECT ... FOR NO KEY UPDATE と同じく、他の更新とは直列になる
+		var deletedID string
+		err := h.DB.GetContext(ctx, &deletedID, `
+  WITH u AS (
+    UPDATE users SET status = 'deleted', deleted_at = clock_timestamp(), updated_at = clock_timestamp()
+    WHERE id = $1 AND status = 'active'
+    RETURNING id
+  ), s AS (
+    UPDATE login_sessions SET active = false, invalidated_at = clock_timestamp(), reason = 'account_deletion'
+    WHERE user_id IN (SELECT id FROM u) AND active = true
+  )
+  SELECT u.id FROM u CROSS JOIN LATERAL (SELECT pg_notify('`+sessionInvalidateChannel+`', u.id::text)) AS notify
+ `, userID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET status='deleted', deleted_at=clock_timestamp(), updated_at=clock_timestamp() WHERE id=$1`, userID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE login_sessions SET active=false, invalidated_at=clock_timestamp(), reason='account_deletion' WHERE user_id=$1 AND active=true`, userID); err != nil {
-			return err
-		}
-		// セッションのキャッシュを全サーバーで消す(通知はコミット時に届く)
-		if err := notifySessionInvalidated(ctx, tx, userID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
 			return err
 		}
 		sessions.invalidateUser(userID)

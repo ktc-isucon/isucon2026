@@ -1,15 +1,43 @@
 package isureal
 
 import (
-	"database/sql"
-	"errors"
+	"context"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/labstack/echo/v5"
 )
+
+// removedImage はDBから消した画像のIDと作成日時(初期データかどうかの判定に使う)。
+type removedImage struct {
+	ID        string
+	CreatedAt time.Time
+}
+
+func scanRemovedImages(dest *[]removedImage) func(pgx.Rows) error {
+	return func(rows pgx.Rows) error {
+		for rows.Next() {
+			var img removedImage
+			if err := rows.Scan(&img.ID, &img.CreatedAt); err != nil {
+				return err
+			}
+			*dest = append(*dest, img)
+		}
+		return nil
+	}
+}
+
+// deleteRemovedRuntimeImages はDBから消した画像のうち、ベンチ中に追加されたもののファイルを消す(ベストエフォート)
+func deleteRemovedRuntimeImages(ctx context.Context, h *HandlerContext, removed []removedImage) {
+	for _, img := range removed {
+		if kind, err := imageKind(ctx, h.DB, img.CreatedAt); err == nil {
+			deleteRuntimeImage(kind, img.ID)
+		}
+	}
+}
 
 func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
@@ -40,39 +68,41 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// BEGIN〜COMMITを1往復で送る。1文目でユーザー行をロックし、2文目はロック後のスナップショットで
+		// 新しい画像の作成・付け替え・古い画像の削除をまとめて行う(ユーザーがいなければ何もしない)
+		var userFound bool
+		var removed []removedImage
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`,
+				args: []any{userID},
+				scan: scanExists(&userFound),
+			},
+			pipelinedStmt{
+				sql: `
+  WITH u AS (
+    SELECT id, profile_image_id AS old FROM users WHERE id = $1
+  ), ins AS (
+    INSERT INTO image_objects (id, owner_user_id, data, media_type, origin_region)
+    SELECT $2::text, id, ''::bytea, 'image/jpeg', $3::text FROM u
+  ), upd AS (
+    UPDATE users SET profile_image_id = $2::text, updated_at = clock_timestamp() WHERE id IN (SELECT id FROM u)
+  ), del AS (
+    DELETE FROM image_objects WHERE id IN (SELECT old FROM u) RETURNING id, created_at
+  )
+  SELECT id, created_at FROM del
+ `,
+				args: []any{userID, imageID, nullableOrigin(imageOrigin)},
+				scan: scanRemovedImages(&removed),
+			},
+		); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		var oldID *string
-		if err := tx.GetContext(ctx, &oldID, `SELECT profile_image_id FROM users WHERE id=$1 FOR NO KEY UPDATE`, userID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return NewAPIError(http.StatusNotFound, "account_not_found")
-			}
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type,origin_region) VALUES ($1,$2,''::bytea,'image/jpeg',$3)`, imageID, userID, nullableOrigin(imageOrigin)); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=$2,updated_at=clock_timestamp() WHERE id=$1`, userID, imageID); err != nil {
-			return err
-		}
-		var oldCreatedAt []time.Time
-		if oldID != nil {
-			if err := tx.SelectContext(ctx, &oldCreatedAt, `DELETE FROM image_objects WHERE id=$1 RETURNING created_at`, *oldID); err != nil {
-				return err
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+		if !userFound {
+			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		userViews.invalidateUser(userID)
-		for _, createdAt := range oldCreatedAt {
-			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
-				deleteRuntimeImage(kind, *oldID)
-			}
-		}
+		deleteRemovedRuntimeImages(ctx, h, removed)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
@@ -81,38 +111,38 @@ func deleteProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
+		// BEGIN〜COMMITを1往復で送る。1文目でユーザー行をロックし、2文目はプロフィール画像があるときだけ外して消す
+		var userFound bool
 		var imageID *string
-		err = tx.GetContext(ctx, &imageID, `SELECT profile_image_id FROM users WHERE id=$1 FOR NO KEY UPDATE`, userID)
-		if errors.Is(err, sql.ErrNoRows) {
+		var removed []removedImage
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT profile_image_id FROM users WHERE id=$1 FOR NO KEY UPDATE`,
+				args: []any{userID},
+				scan: scanFirstRow(&userFound, &imageID),
+			},
+			pipelinedStmt{
+				sql: `
+  WITH u AS (
+    SELECT id, profile_image_id AS old FROM users WHERE id = $1 AND profile_image_id IS NOT NULL
+  ), upd AS (
+    UPDATE users SET profile_image_id = NULL, updated_at = clock_timestamp() WHERE id IN (SELECT id FROM u)
+  ), del AS (
+    DELETE FROM image_objects WHERE id IN (SELECT old FROM u) RETURNING id, created_at
+  )
+  SELECT id, created_at FROM del
+ `,
+				args: []any{userID},
+				scan: scanRemovedImages(&removed),
+			},
+		); err != nil {
+			return err
+		}
+		if !userFound || imageID == nil {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if imageID == nil {
-			return NewAPIError(http.StatusNotFound, "account_not_found")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=NULL,updated_at=clock_timestamp() WHERE id=$1`, userID); err != nil {
-			return err
-		}
-		var deletedCreatedAt []time.Time
-		if err := tx.SelectContext(ctx, &deletedCreatedAt, `DELETE FROM image_objects WHERE id=$1 RETURNING created_at`, *imageID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
 		}
 		userViews.invalidateUser(userID)
-		for _, createdAt := range deletedCreatedAt {
-			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
-				deleteRuntimeImage(kind, *imageID)
-			}
-		}
+		deleteRemovedRuntimeImages(ctx, h, removed)
 		return c.NoContent(http.StatusNoContent)
 	}
 }

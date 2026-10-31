@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
 
@@ -215,38 +216,30 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_profile")
 		}
 		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		if input.DisplayName != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.DisplayName); err != nil {
-				return err
-			}
-		}
-		if input.Bio != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET bio = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.Bio); err != nil {
-				return err
-			}
-		}
-		if input.Region != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET region = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.Region); err != nil {
-				return err
-			}
-			// セッションのキャッシュはリージョンを持つので、全サーバーで消す(通知はコミット時に届く)
-			if err := notifySessionInvalidated(ctx, tx, session.UserID); err != nil {
-				return err
-			}
-		}
-		user, err := getUser(ctx, tx, session.UserID)
+		// 指定された項目の更新と読み直しを1文(1往復)で行う。有効なユーザーだけを更新するので、
+		// 前の実装(更新後に getUser で見つからなければロールバックして404)と同じく、無効なユーザーは何も変わらない。
+		// リージョンを変えるときは、セッションのキャッシュがリージョンを持つので全サーバーで消す(通知はコミット時に届く)
+		var user User
+		err := sqlx.GetContext(ctx, h.DB, &user, `
+  WITH u AS (
+    UPDATE users SET
+      display_name = COALESCE($2::text, display_name),
+      bio = COALESCE($3::text, bio),
+      region = COALESCE($4::text, region),
+      updated_at = clock_timestamp()
+    WHERE id = $1 AND status = 'active'
+    RETURNING `+strings.Join(userColumns, ", ")+`
+  )
+  SELECT `+prefixedUserColumns("u")+` FROM u
+  LEFT JOIN LATERAL (SELECT pg_notify('`+sessionInvalidateChannel+`', u.id::text) WHERE $4::text IS NOT NULL) AS notify ON true
+ `, session.UserID, input.DisplayName, input.Bio, input.Region)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		if input.Region != nil {

@@ -282,42 +282,54 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// BEGIN〜COMMITを1往復で送る。1文目で投稿者の行をロックしてユーザーを取得し(応答にも使う)、
+		// 2文目で投稿の状態を読み、3文目は「本人の投稿で、投稿期間が終わっていない」ときだけ更新して読み直す
+		var user User
+		var userFound, postFound, updated bool
+		var current struct {
+			AuthorID string
+			EndedAt  *time.Time
+		}
+		var post Post
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT ` + strings.Join(userColumns, ", ") + ` FROM users WHERE id = $1 AND status = 'active' FOR NO KEY UPDATE`,
+				args: []any{userID},
+				scan: scanFirstRow(&userFound, userScanDest(&user)...),
+			},
+			pipelinedStmt{
+				sql: `SELECT p.author_id, w.ended_at FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+   WHERE p.id = $1 AND p.deleted_at IS NULL`,
+				args: []any{input.PostID},
+				scan: scanFirstRow(&postFound, &current.AuthorID, &current.EndedAt),
+			},
+			pipelinedStmt{
+				sql: `
+   WITH p AS (
+     UPDATE posts SET caption = COALESCE($3::text, caption), visibility = COALESCE($4::text, visibility)
+     WHERE id = $1 AND author_id = $2 AND deleted_at IS NULL
+       AND EXISTS (SELECT 1 FROM posting_windows w WHERE w.id = posts.posting_window_id AND w.ended_at IS NULL)
+       AND EXISTS (SELECT 1 FROM users u WHERE u.id = $2 AND u.status = 'active')
+     RETURNING *
+   )
+   SELECT ` + postColumns + ` FROM p JOIN posting_windows w ON w.id = p.posting_window_id`,
+				args: []any{input.PostID, userID, input.Caption, input.Visibility},
+				scan: scanFirstRow(&updated, postScanDest(&post)...),
+			},
+		); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		// 行ロックとユーザーの取得を1往復にまとめる(user は応答にも使う)
-		user, err := lockUser(ctx, tx, userID)
-		if err != nil {
-			return err
+		if !userFound {
+			// 前の実装(lockUser)と同じく、有効でないユーザーはエラーにする
+			return sql.ErrNoRows
 		}
-		post, err := getPost(ctx, tx, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
+		if !postFound {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
-		if err != nil {
-			return err
-		}
-		if post.AuthorID != userID {
+		if current.AuthorID != userID || current.EndedAt != nil || !updated {
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
-		// getPost は投稿期間の ended_at も返すので getPostingWindow は不要
-		if post.WindowEndedAt != nil {
-			return NewAPIError(http.StatusForbidden, "post_not_editable")
-		}
-		// caption/visibility の更新と読み直しを1往復にまとめる
-		if err := tx.GetContext(ctx, &post, `
-   WITH p AS (
-     UPDATE posts SET caption = COALESCE($2, caption), visibility = COALESCE($3, visibility)
-     WHERE id = $1 RETURNING *
-   )
-   SELECT `+postColumns+` FROM p JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.deleted_at IS NULL
-  `, post.ID, input.Caption, input.Visibility); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		userViews.invalidateUser(user.ID)
@@ -337,45 +349,56 @@ func deletePostHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var lockedUserID string
-		if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
-			return err
-		}
-		// 投稿の取得と、同じ日の削除済み投稿数の確認を1往復にまとめる
+		// BEGIN〜COMMITを1往復で送る。1文目で投稿者の行をロック(同じ日の削除数はこのロックで守る)、
+		// 2文目で投稿と同じ日の削除済み投稿数を読み、3文目は「本人の投稿で、削除数が2未満」のときだけ削除する
+		var userFound, postFound, deleted bool
 		var post struct {
-			ID        string `db:"id"`
-			AuthorID  string `db:"author_id"`
-			Deletions int    `db:"deletions"`
+			AuthorID  string
+			Deletions int
 		}
-		err = tx.GetContext(ctx, &post, `
-   SELECT p.id, p.author_id,
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`,
+				args: []any{userID},
+				scan: scanExists(&userFound),
+			},
+			pipelinedStmt{
+				sql: `
+   SELECT p.author_id,
      (SELECT count(*) FROM posts dp JOIN posting_windows dw ON dw.id = dp.posting_window_id
       WHERE dp.author_id = $2 AND dw.local_date = w.local_date AND dp.deleted_at IS NOT NULL) AS deletions
    FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.id = $1 AND p.deleted_at IS NULL
-  `, input.PostID, userID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "post_not_found")
-		}
-		if err != nil {
+   WHERE p.id = $1 AND p.deleted_at IS NULL`,
+				args: []any{input.PostID, userID},
+				scan: scanFirstRow(&postFound, &post.AuthorID, &post.Deletions),
+			},
+			pipelinedStmt{
+				sql: `
+   UPDATE posts p SET deleted_at = clock_timestamp()
+   FROM posting_windows w
+   WHERE p.id = $1 AND p.author_id = $2 AND p.deleted_at IS NULL AND w.id = p.posting_window_id
+     AND EXISTS (SELECT 1 FROM users u WHERE u.id = $2)
+     AND (SELECT count(*) FROM posts dp JOIN posting_windows dw ON dw.id = dp.posting_window_id
+          WHERE dp.author_id = $2 AND dw.local_date = w.local_date AND dp.deleted_at IS NOT NULL) < 2
+   RETURNING p.id`,
+				args: []any{input.PostID, userID},
+				scan: scanExists(&deleted),
+			},
+		); err != nil {
 			return err
+		}
+		if !userFound {
+			// 前の実装と同じく、ユーザーの行がなければエラーにする
+			return sql.ErrNoRows
+		}
+		if !postFound {
+			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		if post.AuthorID != userID {
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
 		}
-		if post.Deletions >= 2 {
+		if post.Deletions >= 2 || !deleted {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE posts SET deleted_at = clock_timestamp() WHERE id = $1`, post.ID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
 		}
 		userViews.invalidateUser(userID)
 		return c.NoContent(http.StatusNoContent)

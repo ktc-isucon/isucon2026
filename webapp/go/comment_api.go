@@ -2,7 +2,6 @@ package isureal
 
 import (
 	"database/sql"
-	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -146,34 +145,44 @@ func deleteCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, actor); err != nil {
-			return err
-		}
+		// BEGIN〜COMMITを1往復で送る。1文目で操作する人の行をロック、2文目でコメントを行ロックして読み、
+		// 3文目は「書いた本人か、投稿者」のときだけ削除する
+		var actorFound, found, deleted bool
 		var record struct {
-			AuthorID     string `db:"author_id"`
-			PostAuthorID string `db:"post_author_id"`
+			AuthorID     string
+			PostAuthorID string
 		}
-		err = tx.GetContext(ctx, &record, `SELECT c.author_id,p.author_id AS post_author_id FROM comments c JOIN posts p ON p.id=c.post_id WHERE c.id=$1 AND c.deleted_at IS NULL FOR UPDATE OF c`, input.CommentID)
-		if errors.Is(err, sql.ErrNoRows) {
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`,
+				args: []any{actor},
+				scan: scanExists(&actorFound),
+			},
+			pipelinedStmt{
+				sql:  `SELECT c.author_id,p.author_id AS post_author_id FROM comments c JOIN posts p ON p.id=c.post_id WHERE c.id=$1 AND c.deleted_at IS NULL FOR UPDATE OF c`,
+				args: []any{input.CommentID},
+				scan: scanFirstRow(&found, &record.AuthorID, &record.PostAuthorID),
+			},
+			pipelinedStmt{
+				sql: `UPDATE comments c SET deleted_at=clock_timestamp()
+   WHERE c.id=$1 AND c.deleted_at IS NULL AND EXISTS (SELECT 1 FROM users u WHERE u.id=$2)
+     AND (c.author_id=$2 OR EXISTS (SELECT 1 FROM posts p WHERE p.id=c.post_id AND p.author_id=$2))
+   RETURNING c.id`,
+				args: []any{input.CommentID, actor},
+				scan: scanExists(&deleted),
+			},
+		); err != nil {
+			return err
+		}
+		if !actorFound {
+			// 前の実装と同じく、操作する人の行がなければエラーにする
+			return sql.ErrNoRows
+		}
+		if !found {
 			return NewAPIError(http.StatusNotFound, "interaction_not_found")
 		}
-		if err != nil {
-			return err
-		}
-		if actor != record.AuthorID && actor != record.PostAuthorID {
+		if (actor != record.AuthorID && actor != record.PostAuthorID) || !deleted {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE comments SET deleted_at=clock_timestamp() WHERE id=$1`, input.CommentID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
 		}
 		return c.NoContent(http.StatusNoContent)
 	}

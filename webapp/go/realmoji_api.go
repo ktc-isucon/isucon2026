@@ -2,7 +2,6 @@ package isureal
 
 import (
 	"database/sql"
-	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -187,34 +186,44 @@ func deleteRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, actor); err != nil {
-			return err
-		}
+		// BEGIN〜COMMITを1往復で送る。1文目で操作する人の行をロック、2文目で RealMoji を行ロックして読み、
+		// 3文目は「付けた本人か、投稿者」のときだけ削除する
+		var actorFound, found, deleted bool
 		var record struct {
-			ReactorID string `db:"reactor_id"`
-			AuthorID  string `db:"author_id"`
+			ReactorID string
+			AuthorID  string
 		}
-		err = tx.GetContext(ctx, &record, `SELECT r.reactor_id,p.author_id FROM realmojis r JOIN posts p ON p.id=r.post_id WHERE r.id=$1 AND r.deleted_at IS NULL FOR UPDATE OF r`, input.RealMojiID)
-		if errors.Is(err, sql.ErrNoRows) {
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`,
+				args: []any{actor},
+				scan: scanExists(&actorFound),
+			},
+			pipelinedStmt{
+				sql:  `SELECT r.reactor_id,p.author_id FROM realmojis r JOIN posts p ON p.id=r.post_id WHERE r.id=$1 AND r.deleted_at IS NULL FOR UPDATE OF r`,
+				args: []any{input.RealMojiID},
+				scan: scanFirstRow(&found, &record.ReactorID, &record.AuthorID),
+			},
+			pipelinedStmt{
+				sql: `UPDATE realmojis r SET deleted_at=clock_timestamp()
+   WHERE r.id=$1 AND r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM users u WHERE u.id=$2)
+     AND (r.reactor_id=$2 OR EXISTS (SELECT 1 FROM posts p WHERE p.id=r.post_id AND p.author_id=$2))
+   RETURNING r.id`,
+				args: []any{input.RealMojiID, actor},
+				scan: scanExists(&deleted),
+			},
+		); err != nil {
+			return err
+		}
+		if !actorFound {
+			// 前の実装と同じく、操作する人の行がなければエラーにする
+			return sql.ErrNoRows
+		}
+		if !found {
 			return NewAPIError(http.StatusNotFound, "interaction_not_found")
 		}
-		if err != nil {
-			return err
-		}
-		if actor != record.ReactorID && actor != record.AuthorID {
+		if (actor != record.ReactorID && actor != record.AuthorID) || !deleted {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET deleted_at=clock_timestamp() WHERE id=$1`, input.RealMojiID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
 		}
 		return c.NoContent(http.StatusNoContent)
 	}
