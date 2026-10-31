@@ -135,6 +135,7 @@ CREATE TABLE follows (
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   UNIQUE(follower_id,followee_id)
 );
+CREATE INDEX follows_followee_id ON follows(followee_id);
 
 CREATE TABLE block_relations (
   id varchar(36) PRIMARY KEY,
@@ -183,6 +184,8 @@ CREATE TABLE friend_requests (
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL
 );
+CREATE INDEX friend_requests_requester_recipient ON friend_requests(requester_id, recipient_id);
+CREATE INDEX friend_requests_recipient_requester ON friend_requests(recipient_id, requester_id);
 
 CREATE TABLE realmojis (
   id varchar(36) PRIMARY KEY,

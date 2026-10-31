@@ -52,3 +52,7 @@ DROP INDEX IF EXISTS notifications_user_id_created_at;
 CREATE INDEX IF NOT EXISTS login_sessions_token_hash ON login_sessions(token_hash);
 -- ベンチ中に追加された画像を持っているサーバーのリージョン(NULLならisu3から取得する)。列の追加はメタデータのみで一瞬で終わる
 ALTER TABLE image_objects ADD COLUMN IF NOT EXISTS origin_region text;
+-- 友達リクエストの作成・一覧と、フォロワーの一覧の全件走査をなくす
+CREATE INDEX IF NOT EXISTS friend_requests_requester_recipient ON friend_requests(requester_id, recipient_id);
+CREATE INDEX IF NOT EXISTS friend_requests_recipient_requester ON friend_requests(recipient_id, requester_id);
+CREATE INDEX IF NOT EXISTS follows_followee_id ON follows(followee_id);
