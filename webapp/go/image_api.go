@@ -40,38 +40,21 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
 
-		ctx := c.Request().Context()
-		var secretKeyHash string
-		err = h.DB.GetContext(ctx, &secretKeyHash, `
-   SELECT u.secret_key_hash
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id
-   WHERE i.id = $1 AND u.status = 'active'
-  `, input.ImageID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusForbidden, "image_forbidden")
-		}
-		if err != nil {
-			return err
-		}
-		key, err := imageSigningKey(secretKeyHash)
-		if err != nil {
-			return err
-		}
-		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
-			c.Set("abuse", "invalid_signature")
+		if !validImageID(input.ImageID) {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
 
 		// 削除状態を毎回確認する。即時反映も5秒以内の許容範囲に含まれる。
+		// 署名鍵と閲覧可否を1回の問い合わせで取得する。
+		ctx := c.Request().Context()
 		var object struct {
-			Data      []byte `db:"data"`
-			MediaType string `db:"media_type"`
+			SecretKeyHash string    `db:"secret_key_hash"`
+			CreatedAt     time.Time `db:"created_at"`
+			Visible       bool      `db:"visible"`
 		}
 		err = h.DB.GetContext(ctx, &object, `
-   SELECT i.data, i.media_type
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
-   WHERE i.id = $1 AND (
-     u.profile_image_id = i.id
+   SELECT u.secret_key_hash, i.created_at, (
+     u.profile_image_id IS NOT DISTINCT FROM i.id
      OR EXISTS (
        SELECT 1 FROM posts p
        WHERE p.image_id = i.id AND p.author_id = u.id AND p.deleted_at IS NULL
@@ -82,7 +65,9 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
        JOIN users author ON author.id = p.author_id AND author.status = 'active'
        WHERE r.image_id = i.id AND r.reactor_id = u.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
      )
-   )
+   ) AS visible
+   FROM image_objects i JOIN users u ON u.id = i.owner_user_id
+   WHERE i.id = $1 AND u.status = 'active'
   `, input.ImageID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
@@ -90,9 +75,27 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		key, err := imageSigningKey(object.SecretKeyHash)
+		if err != nil {
+			return err
+		}
+		if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
+			c.Set("abuse", "invalid_signature")
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
+		if !object.Visible {
+			return NewAPIError(http.StatusForbidden, "image_forbidden")
+		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
-		return c.Blob(http.StatusOK, object.MediaType, object.Data)
+		kind, err := imageKind(ctx, h.DB, object.CreatedAt)
+		if err != nil {
+			return err
+		}
+		// 画像本体はnginxが返す(isu0〜2は初期データの画像を手元にキャッシュし、それ以外はisu3から取得する)
+		c.Response().Header().Set("X-Accel-Redirect", "/_img/"+imageRelPath(kind, input.ImageID))
+		c.Response().Header().Set(echo.HeaderContentType, "image/jpeg")
+		return c.NoContent(http.StatusOK)
 	}
 }

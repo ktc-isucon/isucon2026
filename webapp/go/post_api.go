@@ -86,6 +86,9 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
+		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
+		imageID := uuid.NewString()
+		imageStored := putRuntimeImageAsync(imageID, imageData)
 		tx, err := h.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
@@ -126,8 +129,10 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if window.Active != 0 || window.Deleted >= 2 || postedAt.Before(window.StartsAt) {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
 		}
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, userID, imageData, postedAt); err != nil {
+		if err := <-imageStored; err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, ''::bytea, 'image/jpeg', $3)`, imageID, userID, postedAt); err != nil {
 			return err
 		}
 		// INSERT と getPost 相当の読み直しを1往復にまとめる

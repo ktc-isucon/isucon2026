@@ -13,7 +13,8 @@ vars:
   APP_BUILD_CMD: "env PATH={{.SERVER_GO_BIN_DIR}}:/usr/local/bin:/usr/bin:/bin make"
 
   NGINX_SERVICE_NAME: nginx.service
-  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2"
+  # isu3のnginxは画像本体の置き場所として使う
+  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2 isu3"
 
   MYSQL_SERVICE_NAME: mysql.service
   MYSQL_USER_NAME: isuconp
