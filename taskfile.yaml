@@ -386,6 +386,8 @@ tasks:
             ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
             $ssht "sudo systemctl daemon-reload"
             $ssht "sudo systemctl restart {{.APP_SERVICE_NAME}}"
+            # IP BANはアプリ内で判定するので、外部のisureal-guardは止めておく(アプリの起動後に止めてBANの空白を作らない)
+            $ssht "sudo systemctl disable --now isureal-guard.service || true"
           else
             echo "Skip restart nginx on {{.APP_SERVICE_NAME}}"
           fi
