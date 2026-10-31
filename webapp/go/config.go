@@ -35,8 +35,8 @@ func (c *Config) DatabaseDSN() string {
 		Host:   net.JoinHostPort(c.DBHost, c.DBPort),
 		Path:   "/" + c.DBName,
 		// DBへの通信はプライベートネットワーク内(ルーター経由)のため、TLSの往復を省く
-		// default_query_exec_mode=simple_protocol: 値をクライアント側で埋め込み1往復で送り、準備の往復をなくす
-		RawQuery: "sslmode=disable&default_query_exec_mode=simple_protocol",
+		// default_query_exec_mode=exec: 名前なしの文で準備と実行を1往復で送り、接続ごとの準備の往復をなくす
+		RawQuery: "sslmode=disable&default_query_exec_mode=exec",
 	}
 	return u.String()
 }
