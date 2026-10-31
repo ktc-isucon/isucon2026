@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -40,12 +41,7 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 	// advisory lockはInitPlan(LockRowsより下のOne-Time Filter)で評価され、必ず行ロックより先に取られる。
 	// ORDER BY id で行ロックの順も固定し、デッドロックを避ける
 	var lockedIDs []string
-	if err := tx.SelectContext(ctx, &lockedIDs, `
-  SELECT id FROM users
-  WHERE id IN ($1, $2) AND status = 'active'
-    AND (SELECT count(*) FROM (SELECT pg_advisory_xact_lock(hashtextextended('relationship:' || $1 || ':' || $2, 0))) l) = 1
-  ORDER BY id FOR SHARE
- `, min(actor, target), max(actor, target)); err != nil {
+	if err := tx.SelectContext(ctx, &lockedIDs, relationshipLockSQL, min(actor, target), max(actor, target)); err != nil {
 		tx.Rollback()
 		return nil, err
 	}
@@ -54,6 +50,35 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 		return nil, NewAPIError(http.StatusNotFound, "relationship_not_found")
 	}
 	return tx, nil
+}
+
+// relationshipLockSQL は2人分のロックを取る(beginRelationshipTxのコメント参照)。$1 < $2 であること
+const relationshipLockSQL = `
+  SELECT id FROM users
+  WHERE id IN ($1, $2) AND status = 'active'
+    AND (SELECT count(*) FROM (SELECT pg_advisory_xact_lock(hashtextextended('relationship:' || $1 || ':' || $2, 0))) l) = 1
+  ORDER BY id FOR SHARE
+ `
+
+// relationshipLockStmt は runPipelinedTx の1文目として2人分のロックを取り、ロックできた有効なユーザー数を locked に入れる。
+// 後続の文は、2人とも有効なとき(ロックできたとき)だけ変更するよう、relationshipBothActiveSQL で自分で確かめること
+func relationshipLockStmt(actor, target string, locked *int) pipelinedStmt {
+	return pipelinedStmt{
+		sql:  relationshipLockSQL,
+		args: []any{min(actor, target), max(actor, target)},
+		scan: func(rows pgx.Rows) error {
+			for rows.Next() {
+				*locked++
+			}
+			return nil
+		},
+	}
+}
+
+// relationshipBothActiveSQL は、指定の2つのプレースホルダのユーザーが2人とも有効かを返す式を作る。
+// ロック済みの行なので、ロック後の文で評価すれば結果は変わらない
+func relationshipBothActiveSQL(a, b string) string {
+	return "(SELECT count(*) FROM users WHERE id IN (" + a + ", " + b + ") AND status = 'active') = 2"
 }
 
 func isBlocked(ctx context.Context, db sqlx.QueryerContext, actor, target string) (bool, error) {

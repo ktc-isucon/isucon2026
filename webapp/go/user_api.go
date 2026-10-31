@@ -118,31 +118,45 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
 		}
 		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var user User
-		err = tx.GetContext(ctx, &user, `SELECT id, username, secret_key_hash, display_name, bio, profile_image_id, region, account_type, status FROM users WHERE username = $1 FOR NO KEY UPDATE`, input.Username)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
-		}
-		if err != nil {
-			return err
-		}
 		hash := sha256.Sum256([]byte(input.SecretKey))
-		if user.Status != "active" || user.SecretKeyHash != hex.EncodeToString(hash[:]) {
+		secretKeyHash := hex.EncodeToString(hash[:])
+		randomToken := uuid.NewString()
+		tokenHashBytes := sha256.Sum256([]byte(randomToken))
+		// BEGIN〜COMMITを1往復で送る。1文目でユーザー行をロックし、2文目はロック後のスナップショットで
+		// 秘密鍵と有効性を確かめ、合っていたときだけ既存セッションの無効化と新規作成を行う
+		var user User
+		var userFound, sessionCreated bool
+		var session Session
+		if err := runPipelinedTx(ctx, h.DB,
+			pipelinedStmt{
+				sql:  `SELECT id, username, secret_key_hash, display_name, bio, profile_image_id, region, account_type, status FROM users WHERE username = $1 FOR NO KEY UPDATE`,
+				args: []any{input.Username},
+				scan: scanFirstRow(&userFound, &user.ID, &user.Username, &user.SecretKeyHash, &user.DisplayName, &user.Bio, &user.ProfileImageID, &user.Region, &user.AccountType, &user.Status),
+			},
+			pipelinedStmt{
+				sql: `
+  WITH ok AS (
+    SELECT id FROM users WHERE username = $1 AND status = 'active' AND secret_key_hash = $2
+  ), invalidated AS (
+    UPDATE login_sessions
+    SET active = false, invalidated_at = clock_timestamp(), reason = 'replaced'
+    WHERE user_id IN (SELECT id FROM ok) AND active = true
+  )
+  INSERT INTO login_sessions (id, user_id, token_hash)
+  SELECT $3, ok.id, $4 FROM ok
+  CROSS JOIN LATERAL (SELECT pg_notify('`+sessionInvalidateChannel+`', ok.id::text)) AS notify
+  RETURNING user_id, token_hash, created_at
+ `,
+				args: []any{input.Username, secretKeyHash, uuid.NewString(), hex.EncodeToString(tokenHashBytes[:])},
+				scan: scanFirstRow(&sessionCreated, &session.UserID, &session.TokenHash, &session.CreatedAt),
+			},
+		); err != nil {
+			return err
+		}
+		if !userFound || !sessionCreated || user.Status != "active" || user.SecretKeyHash != secretKeyHash {
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
 		}
-		// 上の SELECT ... FOR NO KEY UPDATE で行ロックと有効性の確認が済んでいる
-		session, err := replaceLoginSessionTx(ctx, tx, user.ID)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+		session.Token = randomToken
 		// 置き換えた古いセッションをこのサーバーのキャッシュから消す(他サーバーへはコミット時にNOTIFYが届く)
 		sessions.invalidateUser(user.ID)
 		return c.JSON(http.StatusOK, loginResponse{Token: session.Token, User: newSessionUserResponse(user)})
