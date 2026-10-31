@@ -109,6 +109,10 @@ tasks:
           json=""
           SERVER_ADDRESSES=({{.SERVER_ADDRESSES}})
           for i in $(seq 0 $((${#SERVER_ADDRESSES[@]} - 1))); do
+            # pprof/httplogはアプリが動いているサーバのみ
+            if ! echo {{.DEPLOY_APP_SERVER_NAMES}} | grep -qw "isu$i"; then
+              continue
+            fi
             json+="
               {
                 \"Type\": \"pprof\",
