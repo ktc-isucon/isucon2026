@@ -60,7 +60,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		var oldCreatedAt []time.Time
 		if oldID != nil {
-			if err := tx.SelectContext(ctx, &oldCreatedAt, `DELETE FROM image_objects WHERE id=$1 RETURNING created_at`, *oldID); err != nil {
+			if err := tx.SelectContext(ctx, &oldCreatedAt, deleteImageObjectSQL, *oldID, userID); err != nil {
 				return err
 			}
 		}
@@ -68,6 +68,9 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		userViews.invalidateUser(userID)
+		if len(oldCreatedAt) > 0 {
+			imageAuths.invalidateOwner(userID)
+		}
 		for _, createdAt := range oldCreatedAt {
 			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
 				deleteRuntimeImage(kind, *oldID)
@@ -101,13 +104,16 @@ func deleteProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		var deletedCreatedAt []time.Time
-		if err := tx.SelectContext(ctx, &deletedCreatedAt, `DELETE FROM image_objects WHERE id=$1 RETURNING created_at`, *imageID); err != nil {
+		if err := tx.SelectContext(ctx, &deletedCreatedAt, deleteImageObjectSQL, *imageID, userID); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
 		userViews.invalidateUser(userID)
+		if len(deletedCreatedAt) > 0 {
+			imageAuths.invalidateOwner(userID)
+		}
 		for _, createdAt := range deletedCreatedAt {
 			if kind, err := imageKind(ctx, h.DB, createdAt); err == nil {
 				deleteRuntimeImage(kind, *imageID)

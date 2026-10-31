@@ -44,17 +44,32 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
 		}
 
+		// 「画像の行があり、持ち主が有効」と分かっている画像は、DB を引く前に署名を確かめ、不正なら弾く。
+		// 応答と abuse は、DB を引いてから署名が合わなかった場合(下)と同じ。
+		cached, hit, epoch := imageAuths.begin(input.ImageID)
+		if hit {
+			key, err := imageSigningKey(cached.SecretKeyHash)
+			if err != nil {
+				return err
+			}
+			if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
+				c.Set("abuse", "invalid_signature")
+				return NewAPIError(http.StatusForbidden, "image_forbidden")
+			}
+		}
+
 		// 削除状態を毎回確認する。即時反映も5秒以内の許容範囲に含まれる。
 		// 署名鍵と閲覧可否を1回の問い合わせで取得する。
 		ctx := c.Request().Context()
 		var object struct {
+			OwnerID       string    `db:"owner_id"`
 			SecretKeyHash string    `db:"secret_key_hash"`
 			CreatedAt     time.Time `db:"created_at"`
 			OriginRegion  *string   `db:"origin_region"`
 			Visible       bool      `db:"visible"`
 		}
 		err = h.ReadDB(c).GetContext(ctx, &object, `
-   SELECT u.secret_key_hash, i.created_at, i.origin_region, (
+   SELECT u.id AS owner_id, u.secret_key_hash, i.created_at, i.origin_region, (
      u.profile_image_id IS NOT DISTINCT FROM i.id
      OR EXISTS (
        SELECT 1 FROM posts p
@@ -75,6 +90,12 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		if err != nil {
 			return err
+		}
+		if !hit {
+			imageAuths.put(epoch, input.ImageID, imageAuthEntry{
+				OwnerID: object.OwnerID, SecretKeyHash: object.SecretKeyHash,
+				CreatedAt: object.CreatedAt, OriginRegion: object.OriginRegion,
+			})
 		}
 		key, err := imageSigningKey(object.SecretKeyHash)
 		if err != nil {

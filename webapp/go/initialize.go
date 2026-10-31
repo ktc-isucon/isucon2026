@@ -33,6 +33,8 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		sessions.clear()
 		// 本人向けのキャッシュ(投稿期間・自分の情報・今日の投稿)も消す。他サーバーには同じ通知で届く
 		userViews.clear()
+		// ベンチ中の画像の行が消え、ユーザーの状態も戻るので、画像の署名鍵のキャッシュも消す。他サーバーには同じ通知で届く
+		imageAuths.clear()
 		if err := notifyAllSessionsInvalidated(c.Request().Context(), h.DB); err != nil {
 			return err
 		}

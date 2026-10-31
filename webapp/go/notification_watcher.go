@@ -125,6 +125,8 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 	defer sessions.setEnabled(false)
 	userViews.setEnabled(true)
 	defer userViews.setEnabled(false)
+	imageAuths.setEnabled(true)
+	defer imageAuths.setEnabled(false)
 	connected()
 	w.requestRefresh()
 	for {
@@ -135,6 +137,7 @@ func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) 
 		if n.Channel == sessionInvalidateChannel {
 			sessions.handleNotification(n.Payload)
 			userViews.handleSessionNotification(n.Payload)
+			imageAuths.handleSessionNotification(n.Payload)
 			continue
 		}
 		if n.Channel == imageCacheResetChannel {

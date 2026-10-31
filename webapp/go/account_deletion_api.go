@@ -40,6 +40,8 @@ func deleteAccountHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		sessions.invalidateUser(userID)
 		userViews.invalidateUser(userID)
+		// 持ち主が有効でなくなったので、画像の署名鍵のキャッシュも消す(他サーバーは上の通知で消す)
+		imageAuths.invalidateOwner(userID)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
