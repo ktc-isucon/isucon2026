@@ -12,12 +12,12 @@ import (
 
 func TestLikeContainsPattern(t *testing.T) {
 	cases := map[string]string{
-		"abc":    "%abc%",
-		"a%b":    `%a\%b%`,
-		"a_b":    `%a\_b%`,
-		`a\b`:    `%a\\b%`,
-		`%_\`:    `%\%\_\\%`,
-		"":       "%%",
+		"abc":     "%abc%",
+		"a%b":     `%a\%b%`,
+		"a_b":     `%a\_b%`,
+		`a\b`:     `%a\\b%`,
+		`%_\`:     `%\%\_\\%`,
+		"":        "%%",
 		"ßtrasse": "%ßtrasse%",
 	}
 	for in, want := range cases {

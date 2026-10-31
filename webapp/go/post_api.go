@@ -93,7 +93,6 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		postedAt := time.Now().UTC()
 		postID := uuid.NewString()
 		// BEGIN〜COMMITを1往復で送る。
 		// 1文目: 投稿者の行ロック(当日の投稿数・削除数を並行する変更から守る)と、応答に使うユーザーの取得
@@ -114,24 +113,25 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
        AND NOT EXISTS (SELECT 1 FROM posts WHERE id = $1)
      FOR SHARE OF w
    ), ok AS (
-     SELECT win.* FROM win
+     -- 投稿時刻は、投稿期間の行をロックしたあとのDBの時刻にする(参考実装はロック後に time.Now() を取っていた)。
+     -- バッチを送る前のアプリの時刻だと、その間に次の投稿期間が開くと「開始より前」と判定されて拒否されてしまう
+     SELECT win.*, clock_timestamp() AS posted_at FROM win
      WHERE (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
             WHERE p.author_id = $2 AND pw.local_date = win.local_date AND p.deleted_at IS NULL) = 0
        AND (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
             WHERE p.author_id = $2 AND pw.local_date = win.local_date AND p.deleted_at IS NOT NULL) < 2
-       AND $10::timestamptz >= win.starts_at
    ), img AS (
      INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at, origin_region)
-     SELECT $3::text, $2::text, ''::bytea, 'image/jpeg', $10::timestamptz, $11::text FROM ok
+     SELECT $3::text, $2::text, ''::bytea, 'image/jpeg', ok.posted_at, $10::text FROM ok
    ), p AS (
      INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
                         location_kind, latitude, longitude, locality, posted_at)
-     SELECT $1::text, $2::text, ok.id, $3::text, $4::text, $5::text, $6::text, $7::float8, $8::float8, $9::text, $10::timestamptz FROM ok
+     SELECT $1::text, $2::text, ok.id, $3::text, $4::text, $5::text, $6::text, $7::float8, $8::float8, $9::text, ok.posted_at FROM ok
      RETURNING *
    )
    SELECT ` + postColumns + ` FROM p JOIN ok w ON w.id = p.posting_window_id`,
 				args: []any{postID, userID, imageID, input.Caption, input.Visibility,
-					location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt, nullableOrigin(imageOrigin)},
+					location.Kind, location.Latitude, location.Longitude, location.Locality, nullableOrigin(imageOrigin)},
 				scan: scanFirstRow(created, postScanDest(dest)...),
 			}
 		}
