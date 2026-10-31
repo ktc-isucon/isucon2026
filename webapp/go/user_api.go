@@ -144,7 +144,7 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
   )
   INSERT INTO login_sessions (id, user_id, token_hash)
   SELECT $3, ok.id, $4 FROM ok
-  CROSS JOIN LATERAL (SELECT pg_notify('`+sessionInvalidateChannel+`', ok.id::text)) AS notify
+  CROSS JOIN LATERAL (SELECT pg_notify('` + sessionInvalidateChannel + `', ok.id::text)) AS notify
   RETURNING user_id, token_hash, created_at
  `,
 				args: []any{input.Username, secretKeyHash, uuid.NewString(), hex.EncodeToString(tokenHashBytes[:])},
