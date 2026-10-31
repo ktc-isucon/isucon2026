@@ -99,8 +99,14 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		// 画像のPUT完了は投稿期間をロックする前に待ち、ロックを持つ時間を短くする
+		if err := <-imageStored; err != nil {
+			return err
+		}
 		// 投稿期間のロックと当日の投稿数の確認を1往復にまとめる。
-		// 投稿数は投稿者本人の投稿だけを数えるので、上の行ロックで並行する変更から守られる
+		// 投稿数は投稿者本人の投稿だけを数えるので、上の行ロックで並行する変更から守られる。
+		// 投稿期間は共有ロック(FOR SHARE)にする。同じリージョンの投稿同士は並行でき、
+		// 投稿期間を終了するUPDATEは実行中の投稿のコミットを待つので、終了済みの期間には投稿されない
 		var window struct {
 			ID        string    `db:"id"`
 			LocalDate time.Time `db:"local_date"`
@@ -114,7 +120,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
       WHERE p.author_id = $2 AND pw.local_date = w.local_date AND p.deleted_at IS NULL) AS active,
      (SELECT count(*) FROM posts p JOIN posting_windows pw ON pw.id = p.posting_window_id
       WHERE p.author_id = $2 AND pw.local_date = w.local_date AND p.deleted_at IS NOT NULL) AS deleted
-   FROM posting_windows w WHERE w.region = $1 AND w.ended_at IS NULL FOR UPDATE OF w`
+   FROM posting_windows w WHERE w.region = $1 AND w.ended_at IS NULL FOR SHARE OF w`
 		err = tx.GetContext(ctx, &window, windowQuery, user.Region, userID)
 		if errors.Is(err, sql.ErrNoRows) {
 			err = tx.GetContext(ctx, &window, windowQuery, user.Region, userID)
@@ -128,9 +134,6 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		postedAt := time.Now().UTC()
 		if window.Active != 0 || window.Deleted >= 2 || postedAt.Before(window.StartsAt) {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		if err := <-imageStored; err != nil {
-			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, ''::bytea, 'image/jpeg', $3)`, imageID, userID, postedAt); err != nil {
 			return err

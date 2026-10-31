@@ -47,5 +47,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username);
 CREATE INDEX IF NOT EXISTS posts_image_id ON posts(image_id);
 CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis(image_id);
 CREATE INDEX IF NOT EXISTS friendships_user_high_id ON friendships(user_high_id);
-CREATE INDEX IF NOT EXISTS notifications_user_id_created_at ON notifications(user_id, created_at);
+-- notificationsはUNIQUE(user_id,posting_window_id)でuser_idから引けるので、通知作成を重くする追加インデックスは持たない
+DROP INDEX IF EXISTS notifications_user_id_created_at;
 CREATE INDEX IF NOT EXISTS login_sessions_token_hash ON login_sessions(token_hash);
