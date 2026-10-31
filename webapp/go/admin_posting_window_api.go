@@ -79,6 +79,7 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
      SELECT gen_random_uuid()::text, u.id, w.id, w.starts_at FROM window_row w JOIN users u ON u.region = w.region AND u.status = 'active'
    )
    SELECT id, region, local_date, starts_at, on_time_deadline, ended_at FROM window_row
+   CROSS JOIN (SELECT pg_notify('posting_window', $2::text)) AS notify
   `, uuid.NewString(), region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
 			return err
 		}

@@ -47,7 +47,7 @@ func NewServer(config *Config) *echo.Echo {
 		Config: config,
 		IPBans: &IPBanList{},
 
-		Notifications: newNotificationWatcher(db),
+		Notifications: newNotificationWatcher(db, config.DatabaseDSN()),
 	}
 	go handlerContext.Notifications.run(context.Background())
 	e.Use(IPBanMiddleware(handlerContext))

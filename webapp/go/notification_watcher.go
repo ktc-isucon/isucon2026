@@ -8,14 +8,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jmoiron/sqlx"
 )
 
+// postingWindowChannel は投稿期間の開始を知らせる LISTEN/NOTIFY のチャネル名(ペイロードはリージョン)
+const postingWindowChannel = "posting_window"
+
 // notificationWatcher はサーバーごとに1本だけDBを監視し、SSE接続ごとのポーリングを置き換える。
-// 500msおきに有効な投稿期間とSSE接続中のユーザーをまとめて確認し、
-// 投稿期間が変わったリージョンの接続と、無効になったユーザーの接続に知らせる。
+// 投稿期間の開始は LISTEN/NOTIFY で即座に受け取り、取りこぼし対策として2秒おきにも確認する。
+// SSE接続中のユーザーは500msおきにまとめて確認し、無効になったユーザーの接続に知らせる。
 type notificationWatcher struct {
-	db *sqlx.DB
+	db  *sqlx.DB
+	dsn string
+	// refresh は投稿期間の取り直しを依頼する(バッファ1、溢れた分は捨ててよい)
+	refresh chan struct{}
 
 	mu       sync.Mutex
 	windows  map[string]string // region -> 有効な投稿期間のID(連結)。nil は未取得
@@ -34,24 +41,91 @@ func (s *notificationSubscriber) end() {
 	s.endOnce.Do(func() { close(s.gone) })
 }
 
-func newNotificationWatcher(db *sqlx.DB) *notificationWatcher {
+func newNotificationWatcher(db *sqlx.DB, dsn string) *notificationWatcher {
 	return &notificationWatcher{
 		db:       db,
+		dsn:      dsn,
+		refresh:  make(chan struct{}, 1),
 		changed:  map[string]chan struct{}{},
 		watchers: map[*notificationSubscriber]struct{}{},
 	}
 }
 
 func (w *notificationWatcher) run(ctx context.Context) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	go w.listen(ctx)
+	go func() {
+		windowTicker := time.NewTicker(2 * time.Second)
+		defer windowTicker.Stop()
+		for {
+			w.pollWindows(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-windowTicker.C:
+			case <-w.refresh:
+			}
+		}
+	}()
+	userTicker := time.NewTicker(500 * time.Millisecond)
+	defer userTicker.Stop()
 	for {
-		w.poll(ctx)
+		w.pollUsers(ctx)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-userTicker.C:
 		}
+	}
+}
+
+func (w *notificationWatcher) requestRefresh() {
+	select {
+	case w.refresh <- struct{}{}:
+	default:
+	}
+}
+
+// listen は専用のDB接続で投稿期間の開始通知を待ち、届いたリージョンの購読者にすぐ知らせる。
+// 接続が切れたら間隔を広げながら繋ぎ直し、繋ぎ直した直後に投稿期間を取り直す(切断中の取りこぼし対策)。
+func (w *notificationWatcher) listen(ctx context.Context) {
+	backoff := 100 * time.Millisecond
+	for ctx.Err() == nil {
+		if err := w.listenOnce(ctx, func() { backoff = 100 * time.Millisecond }); err != nil && ctx.Err() == nil {
+			slog.Error("failed to listen posting window notifications", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, 5*time.Second)
+	}
+}
+
+func (w *notificationWatcher) listenOnce(ctx context.Context, connected func()) error {
+	conn, err := pgx.Connect(ctx, w.dsn)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, "LISTEN "+postingWindowChannel); err != nil {
+		return err
+	}
+	connected()
+	w.requestRefresh()
+	for {
+		n, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		w.mu.Lock()
+		if ch, ok := w.changed[n.Payload]; ok {
+			close(ch)
+			delete(w.changed, n.Payload)
+		}
+		w.mu.Unlock()
+		// 通知で知らせた分の状態を揃えるため、投稿期間の一覧も取り直す
+		w.requestRefresh()
 	}
 }
 
@@ -85,7 +159,7 @@ func (w *notificationWatcher) unsubscribe(s *notificationSubscriber) {
 	w.mu.Unlock()
 }
 
-func (w *notificationWatcher) poll(ctx context.Context) {
+func (w *notificationWatcher) pollWindows(ctx context.Context) {
 	var rows []struct {
 		ID     string `db:"id"`
 		Region string `db:"region"`
@@ -117,7 +191,9 @@ func (w *notificationWatcher) poll(ctx context.Context) {
 		w.windows = next
 		w.mu.Unlock()
 	}
+}
 
+func (w *notificationWatcher) pollUsers(ctx context.Context) {
 	w.mu.Lock()
 	subs := make([]*notificationSubscriber, 0, len(w.watchers))
 	userIDs := make([]string, 0, len(w.watchers))
