@@ -678,4 +678,3 @@ func Validate(r io.Reader) (width, height int, err error) {
 	}
 	return d.width, d.height, nil
 }
-
