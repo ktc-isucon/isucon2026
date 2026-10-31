@@ -213,7 +213,6 @@ CREATE TABLE notifications (
   created_at timestamptz NOT NULL,
   UNIQUE(user_id,posting_window_id)
 );
-CREATE INDEX notifications_user_id_created_at ON notifications(user_id, created_at);
 
 CREATE TABLE ip_bans (
   ip text PRIMARY KEY,
