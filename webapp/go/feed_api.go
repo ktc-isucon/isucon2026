@@ -201,7 +201,10 @@ const feedViewerSetCTEs = `feed_friends AS MATERIALIZED (
 const (
 	feedAuthorIsFriendSQL    = `p.author_id = ANY (ARRAY(SELECT id FROM feed_friends))`
 	feedAuthorIsNotFriendSQL = `p.author_id <> ALL (ARRAY(SELECT id FROM feed_friends))`
-	feedAuthorIsFoFSQL       = `p.author_id = ANY (ARRAY(SELECT id FROM feed_fofs))`
+	// 友達の友達は数千人になりうる。実行時の配列との = ANY は1行ごとの線形探索になるので、
+	// ハッシュで照合する IN (サブクエリ) にする。左辺は || '' で値を変えずに式にして、
+	// 作者のインデックスを起点にする計画を選ばせない(開いている投稿期間の投稿を絞ったあとに照合する)
+	feedAuthorIsFoFSQL = `(p.author_id || '') IN (SELECT id FROM feed_fofs)`
 )
 
 // feedPostsWithAuthorStmt は、feedCandidateConditions の条件で投稿と投稿者を読む(閲覧者の集合の CTE を前に付ける)。
