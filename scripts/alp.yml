@@ -9,6 +9,24 @@ limit: # 5000
 noheaders: # boolean
 show_footers: # boolean
 matching_groups:
+  - '^/api/users/[^/?]+(\?.*)?$'
+  - '^/api/posts/me/current(\?.*)?$'
+  - '^/api/posts/[^/?]+/comments(\?.*)?$'
+  - '^/api/posts/[^/?]+/realmojis(\?.*)?$'
+  - '^/api/posts/[^/?]+(\?.*)?$'
+  - '^/api/memories/[^/?]+(\?.*)?$'
+  - '^/api/comments/[^/?]+(\?.*)?$'
+  - '^/api/realmojis/[^/?]+(\?.*)?$'
+  - '^/api/images/[^/?]+(\?.*)?$'
+  - '^/api/friend-requests/[^/?]+/accept(\?.*)?$'
+  - '^/api/friend-requests/[^/?]+/reject(\?.*)?$'
+  - '^/api/friend-requests/[^/?]+/cancel(\?.*)?$'
+  - '^/api/friend-requests/[^/?]+/[^/?]+(\?.*)?$'
+  - '^/api/friendships/[^/?]+(\?.*)?$'
+  - '^/api/follows/[^/?]+(\?.*)?$'
+  - '^/api/blocks/[^/?]+(\?.*)?$'
+  - '^/api/admin/users/[^/?]+/certification(\?.*)?$'
+  - '^/assets/.+$'
 filters: # string
 output: # string(comma separated)
 pos_file: # string
