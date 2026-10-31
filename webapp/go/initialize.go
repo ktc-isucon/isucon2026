@@ -37,6 +37,11 @@ func initializeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := resetRuntimeImages(); err != nil {
 			log.Printf("failed to reset runtime images: %v", err)
 		}
+		// 手元にキャッシュしたベンチ中の画像も消し、他サーバーにも消すよう知らせる
+		resetLocalRuntimeImages()
+		if err := notifyImageCacheReset(c.Request().Context(), h.DB); err != nil {
+			return err
+		}
 
 		// pproteinに計測開始を通知する(PPROTEIN_URL例: http://192.168.0.100:9000)
 		if pproteinURL := os.Getenv("PPROTEIN_URL"); pproteinURL != "" {
