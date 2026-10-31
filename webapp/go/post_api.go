@@ -1,10 +1,8 @@
 package isureal
 
 import (
-	"bytes"
 	"database/sql"
 	"errors"
-	"image/jpeg"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -77,11 +75,12 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		img, err := jpeg.Decode(bytes.NewReader(imageData))
-		if err != nil {
+		// デコード失敗も上限超えも同じ400なので、上限超えは全体のデコードを省略してよい
+		check := checkJPEG(imageData, 4096)
+		if !check.decoded || !check.ok {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
-		if img.Bounds().Dx() > 4096 || img.Bounds().Dy() > 4096 {
+		if check.width > 4096 || check.height > 4096 {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 

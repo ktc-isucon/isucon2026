@@ -8,6 +8,9 @@ User=isucon
 Group=isucon
 # pproteinでnginxのaccess.log(www-data:adm 0640)を読むため
 SupplementaryGroups=adm
+# GCの頻度を下げる(メモリ3.8GB。上限を2GiBにして、それまではGCを控えめにする)
+Environment=GOGC=400
+Environment=GOMEMLIMIT=2GiB
 WorkingDirectory=/home/isucon/webapp/go
 EnvironmentFile=/home/isucon/env.sh
 ExecStart=/home/isucon/webapp/go/isureal
