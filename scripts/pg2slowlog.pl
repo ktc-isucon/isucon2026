@@ -23,6 +23,10 @@ while (my $line = <>) {
     $query =~ s/\bFOR NO KEY UPDATE\b/FOR UPDATE/gi;
     $query =~ s/\s*;?\s*\z/;/;
 
+    # pgxの"-- ping"のようなコメントのみのクエリはslpがpanicするため除外する
+    (my $body = $query) =~ s{--[^\n]*|/\*.*?\*/}{}gs;
+    next unless $body =~ /[^\s;]/;
+
     my $ts = $log->{timestamp} // '';
     my ($time, $epoch) = ('', 0);
     if ($ts =~ /\A(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?/) {
