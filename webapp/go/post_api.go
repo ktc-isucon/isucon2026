@@ -235,18 +235,12 @@ func getPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		ctx := c.Request().Context()
-		post, err := getPostWithAuthor(ctx, h.ReadDB(c), input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "post_not_found")
-		}
+		// 投稿と閲覧者を1回の往復で読む
+		post, postFound, viewer, viewerFound, err := loadPostAndViewer(ctx, h.ReadDB(c), input.PostID, GetSession(c).UserID)
 		if err != nil {
 			return err
 		}
-		viewer, err := loadViewerContext(ctx, h.ReadDB(c), GetSession(c).UserID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if err != nil || !viewer.canView(post.Post) {
+		if !postFound || !viewerFound || !viewer.canView(post.Post) {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		return c.JSON(http.StatusOK, getPostResponse(newPostResponse(post.Post, post.Author)))

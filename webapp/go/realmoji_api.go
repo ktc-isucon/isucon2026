@@ -152,16 +152,16 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		allowed, err := canViewPost(ctx, h.ReadDB(c), GetSession(c).UserID, input.PostID)
+		// 投稿・閲覧者・RealMojiを1回の往復で読み、閲覧できるかで捨てるかを決める
+		var reactions []RealMojiWithReactor
+		post, postFound, viewer, viewerFound, err := loadPostAndViewer(ctx, h.ReadDB(c), input.PostID, GetSession(c).UserID,
+			currentRealMojisStmt(`AND r.post_id=$1 AND ($2::timestamptz IS NULL OR (r.created_at,r.id)<($2,$3)) ORDER BY r.created_at DESC,r.id DESC LIMIT 51`, &reactions, input.PostID, input.BeforeCreatedAt, input.BeforeID))
 		if err != nil {
 			return err
 		}
-		if !allowed {
+		// canViewPost と同じ判定
+		if !postFound || !viewerFound || !viewer.canView(post.Post) {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		reactions, err := selectCurrentRealMojis(ctx, h.ReadDB(c), `AND r.post_id=$1 AND ($2::timestamptz IS NULL OR (r.created_at,r.id)<($2,$3)) ORDER BY r.created_at DESC,r.id DESC LIMIT 51`, input.PostID, input.BeforeCreatedAt, input.BeforeID)
-		if err != nil {
-			return err
 		}
 		items := make([]replaceRealMojiResponse, 0, len(reactions))
 		for _, reaction := range reactions {
