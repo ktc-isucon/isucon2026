@@ -54,6 +54,29 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		// 候補はSQLで閲覧可否とフィードの条件で絞り、並べ替えのないフィードは51件で打ち切る。
 		// SQLの条件は loadViewerContext・canView・matchesFeed と同じ定義で、Go側でも最終確認する。
 		conditions := feedCandidateConditions(input.Feed)
+		if ranked {
+			// おすすめのスコアをSQLで求めて並べ替え、カーソルの後ろの51件だけを読む(候補全体や友達関係を転送しない)。
+			// Go側の閲覧可否・フィードの判定に合わない行が1件でもあれば、従来の全件の経路で求め直す。
+			var viewer viewerContext
+			var viewerFound bool
+			var rows []rankedFeedRow
+			if err := runPipelinedSnapshot(ctx, h.ReadDB(c),
+				viewerStmt(viewerID, &viewer, &viewerFound),
+				rankedFeedStmt(&rows, viewerID, input.BeforeScore, input.BeforePostedAt, input.BeforeID),
+			); err != nil {
+				return err
+			}
+			if !viewerFound {
+				return c.JSON(http.StatusOK, getFeedResponse{Items: []feedItemResponse{}})
+			}
+			if items, ok := rankedFeedItems(viewer, rows); ok {
+				hasMore := len(items) > 50
+				if hasMore {
+					items = items[:50]
+				}
+				return c.JSON(http.StatusOK, getFeedResponse{Items: items, HasMore: hasMore})
+			}
+		}
 		postConditions := conditions + ` ORDER BY p.posted_at DESC, p.id DESC`
 		if !ranked {
 			postConditions += ` LIMIT 51`
@@ -130,6 +153,21 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, getFeedResponse{Items: items, HasMore: hasMore})
 	}
+}
+
+// rankedFeedItems は rankedFeedStmt の結果を応答の形にする。どれかが閲覧可否・フィードの判定に合わなければ ok=false。
+func rankedFeedItems(viewer viewerContext, rows []rankedFeedRow) ([]feedItemResponse, bool) {
+	items := make([]feedItemResponse, 0, len(rows))
+	for _, row := range rows {
+		if !viewer.canView(row.post.Post) || !matchesFeed(viewer, nil, row.post.Post, "friends-of-friends") {
+			return nil, false
+		}
+		score := row.score
+		item := feedItemResponse{createPostResponse: newPostResponse(row.post.Post, row.post.Author)}
+		item.Score = &score
+		items = append(items, item)
+	}
+	return items, true
 }
 
 func rankedBefore(score int64, post Post, beforeScore int64, beforePostedAt time.Time, beforeID string) bool {
