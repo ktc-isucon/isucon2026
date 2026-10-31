@@ -103,6 +103,7 @@ CREATE TABLE login_sessions (
   invalidated_at timestamptz,
   reason text
 );
+CREATE INDEX login_sessions_token_hash ON login_sessions(token_hash);
 
 CREATE TABLE administrator_sessions (
   id varchar(36) PRIMARY KEY,
