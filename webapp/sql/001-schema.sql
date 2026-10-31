@@ -26,6 +26,8 @@ CREATE TABLE image_objects (
   -- like: image/jpeg, image/png
   media_type text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  -- ベンチ中に追加された画像を持っているサーバーのリージョン(NULLならisu3から取得する)
+  origin_region text,
   PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 CREATE TABLE image_objects_202409 PARTITION OF image_objects FOR VALUES FROM ('2024-09-01 00:00:00+00') TO ('2024-10-01 00:00:00+00');

@@ -50,10 +50,11 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		var object struct {
 			SecretKeyHash string    `db:"secret_key_hash"`
 			CreatedAt     time.Time `db:"created_at"`
+			OriginRegion  *string   `db:"origin_region"`
 			Visible       bool      `db:"visible"`
 		}
 		err = h.ReadDB(c).GetContext(ctx, &object, `
-   SELECT u.secret_key_hash, i.created_at, (
+   SELECT u.secret_key_hash, i.created_at, i.origin_region, (
      u.profile_image_id IS NOT DISTINCT FROM i.id
      OR EXISTS (
        SELECT 1 FROM posts p
@@ -96,7 +97,12 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		// 画像本体はnginxが返す(isu0〜2は初期データの画像を手元にキャッシュし、それ以外はisu3から取得する)
 		// 成功時だけブラウザにキャッシュさせる。投稿削除後の取得禁止(5秒の猶予)に収まるよう5秒にする
 		c.Response().Header().Set("Cache-Control", "private, max-age=5")
-		c.Response().Header().Set("X-Accel-Redirect", "/_img/"+imageRelPath(kind, input.ImageID))
+		accelPath := "/_img/" + imageRelPath(kind, input.ImageID)
+		if kind == imageKindRuntime && object.OriginRegion != nil {
+			// 別のリージョンのサーバーが持っている画像は、そのサーバー(落ちていればisu3)から取得させる
+			accelPath = runtimeImageAccelPath(*object.OriginRegion, input.ImageID)
+		}
+		c.Response().Header().Set("X-Accel-Redirect", accelPath)
 		c.Response().Header().Set(echo.HeaderContentType, "image/jpeg")
 		return c.NoContent(http.StatusOK)
 	}

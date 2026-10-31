@@ -35,9 +35,12 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		// 画像本体はisu3へ保存する。DBのトランザクションと並行してPUTする
+		// 画像本体はこのサーバーの手元に置く(isu3へのPUTは裏で続ける)
 		imageID := uuid.NewString()
-		imageStored := putRuntimeImageAsync(imageID, data)
+		imageOrigin, err := storeUploadedImage(imageID, data)
+		if err != nil {
+			return err
+		}
 		tx, err := h.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return err
@@ -50,10 +53,7 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			return err
 		}
-		if err := <-imageStored; err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES ($1,$2,''::bytea,'image/jpeg')`, imageID, userID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type,origin_region) VALUES ($1,$2,''::bytea,'image/jpeg',$3)`, imageID, userID, nullableOrigin(imageOrigin)); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=$2,updated_at=clock_timestamp() WHERE id=$1`, userID, imageID); err != nil {

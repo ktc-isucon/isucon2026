@@ -65,9 +65,10 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		// 画像本体はisu3へ保存する。画像の行はPUTが成功したときだけ作るので、バッチを送る前に完了を待つ
+		// 画像本体はこのサーバーの手元に置く(isu3へのPUTは裏で続ける)。画像の行は保存に成功したときだけ作る
 		imageID := uuid.NewString()
-		if err := <-putRuntimeImageAsync(imageID, data); err != nil {
+		imageOrigin, err := storeUploadedImage(imageID, data)
+		if err != nil {
 			return err
 		}
 		// BEGIN〜COMMITを1往復で送る。
@@ -102,8 +103,8 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 				args: []any{input.PostID, actor},
 			},
 			pipelinedStmt{
-				sql:  `INSERT INTO image_objects(id,owner_user_id,data,media_type) SELECT $1::text, $2::text, ''::bytea, 'image/jpeg' WHERE ` + realmojiOK,
-				args: []any{imageID, actor},
+				sql:  `INSERT INTO image_objects(id,owner_user_id,data,media_type,origin_region) SELECT $1::text, $2::text, ''::bytea, 'image/jpeg', $3::text WHERE ` + realmojiOK,
+				args: []any{imageID, actor, nullableOrigin(imageOrigin)},
 			},
 			pipelinedStmt{
 				sql: `
