@@ -46,6 +46,10 @@ func getSessionFromHeader(c *echo.Context, db *sqlx.DB) (*Session, error) {
 
 	tokenHashBytes := sha256.Sum256([]byte(token))
 	tokenHash := hex.EncodeToString(tokenHashBytes[:])
+	cached, hit, epoch := sessions.begin(tokenHash)
+	if hit {
+		return &cached, nil
+	}
 	var session Session
 	err := db.GetContext(c.Request().Context(), &session, `
 		SELECT s.user_id, s.token_hash, s.created_at, u.region
@@ -59,6 +63,7 @@ func getSessionFromHeader(c *echo.Context, db *sqlx.DB) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
+	sessions.put(epoch, session)
 	return &session, nil
 }
 
@@ -79,7 +84,7 @@ func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.M
 }
 
 func InvalidateLoginSession(db *sqlx.DB, userID string, tokenHash string) error {
-	// 行ロックとセッションの無効化を1文(1往復、暗黙のトランザクション)で行う
+	// 行ロックとセッションの無効化、他サーバーへのキャッシュ無効化の通知を1文(1往復、暗黙のトランザクション)で行う
 	var locked int
 	if err := db.Get(&locked, `
 		WITH u AS (
@@ -89,10 +94,11 @@ func InvalidateLoginSession(db *sqlx.DB, userID string, tokenHash string) error 
 			SET active = false, invalidated_at = clock_timestamp(), reason = 'logout'
 			WHERE user_id IN (SELECT id FROM u) AND active = true AND token_hash = $2
 		)
-		SELECT count(*) FROM u
+		SELECT count(*) FROM u CROSS JOIN (SELECT pg_notify('`+sessionInvalidateChannel+`', $1::text)) AS notify
 	`, userID, tokenHash); err != nil {
 		return fmt.Errorf("failed to invalidate sessions: %w", err)
 	}
+	sessions.invalidateUser(userID)
 	if locked == 0 {
 		return fmt.Errorf("failed to lock user: %w", sql.ErrNoRows)
 	}
@@ -115,6 +121,7 @@ func CreateLoginSession(db *sqlx.DB, userID string) (*Session, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
+	sessions.invalidateUser(userID)
 	return session, nil
 }
 
@@ -141,7 +148,7 @@ func replaceLoginSessionTx(ctx context.Context, tx *sqlx.Tx, userID string) (*Se
     WHERE user_id = $2 AND active = true
   )
   INSERT INTO login_sessions (id, user_id, token_hash)
-  VALUES ($1, $2, $3)
+  SELECT $1, $2, $3 FROM (SELECT pg_notify('`+sessionInvalidateChannel+`', $2::text)) AS notify
   RETURNING user_id, token_hash, created_at
  `, uuid.NewString(), userID, tokenHash); err != nil {
 		return nil, fmt.Errorf("failed to replace session: %w", err)
