@@ -50,6 +50,11 @@ func NewServer(config *Config) *echo.Echo {
 		Notifications: newNotificationWatcher(db),
 	}
 	go handlerContext.Notifications.run(context.Background())
+	// 最初のリクエストからBANを反映できるよう、起動時に一度読んでから裏で読み直す
+	if err := handlerContext.IPBans.Reload(context.Background(), db); err != nil {
+		e.Logger.Error("failed to load ip bans", "error", err)
+	}
+	go handlerContext.IPBans.Run(context.Background(), db)
 	e.Use(IPBanMiddleware(handlerContext))
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
