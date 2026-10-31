@@ -41,32 +41,59 @@ func searchUsersHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		viewer := GetSession(c).UserID
-		var users []User
-		if err := h.DB.SelectContext(ctx, &users, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE status='active' AND id<>$1 AND ($2='' OR (username,id)>($2,$3)) ORDER BY username, id`, viewer, input.BeforeUsername, input.BeforeID); err != nil {
-			return err
+		// 絞り込みに必要な列(id, username, display_name)だけを全件取り、部分一致はアプリで判定する。
+		// 正規化はUnicodeのcase folding + NFCなので、SQLでは同じ結果を保証できない。
+		// europe/americaは帯域制限があるため、secret_key_hashやbioを含む全列の全件取得を避ける
+		var candidates []struct {
+			ID          string `db:"id"`
+			Username    string `db:"username"`
+			DisplayName string `db:"display_name"`
 		}
-		blocked, err := getBlockedUserIDs(ctx, h.DB, viewer)
-		if err != nil {
+		if err := h.DB.SelectContext(ctx, &candidates, `
+   SELECT u.id, u.username, u.display_name FROM users u
+   WHERE u.status='active' AND u.id<>$1 AND ($2='' OR (u.username,u.id)>($2,$3))
+     AND NOT EXISTS (
+       SELECT 1 FROM block_relations b
+       WHERE (b.blocker_id=$1 AND b.blocked_id=u.id) OR (b.blocked_id=$1 AND b.blocker_id=u.id)
+     )
+   ORDER BY u.username, u.id
+  `, viewer, input.BeforeUsername, input.BeforeID); err != nil {
 			return err
 		}
 		query := normalizeSearchText(input.Q)
-		items := make([]relationshipUserResponse, 0)
-		for _, user := range users {
-			if !strings.Contains(normalizeSearchText(user.Username), query) && !strings.Contains(normalizeSearchText(user.DisplayName), query) {
+		matchedIDs := make([]string, 0, 51)
+		for _, candidate := range candidates {
+			if !strings.Contains(normalizeSearchText(candidate.Username), query) && !strings.Contains(normalizeSearchText(candidate.DisplayName), query) {
 				continue
 			}
-			if blocked[user.ID] {
-				continue
+			matchedIDs = append(matchedIDs, candidate.ID)
+			if len(matchedIDs) == 51 {
+				break
 			}
-			if err := user.setImageKey(); err != nil {
+		}
+		// 一致した最大51人分だけ、応答に必要な全列を取る
+		items := make([]relationshipUserResponse, 0, len(matchedIDs))
+		if len(matchedIDs) > 0 {
+			var users []User
+			if err := h.DB.SelectContext(ctx, &users, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = ANY($1) AND status='active'`, matchedIDs); err != nil {
 				return err
 			}
-			if user.AccountType != "certified_public" {
-				user.Bio = ""
+			byID := make(map[string]User, len(users))
+			for _, user := range users {
+				byID[user.ID] = user
 			}
-			items = append(items, newRelationshipUserResponse(user))
-			if len(items) == 51 {
-				break
+			for _, id := range matchedIDs {
+				user, ok := byID[id]
+				if !ok {
+					continue
+				}
+				if err := user.setImageKey(); err != nil {
+					return err
+				}
+				if user.AccountType != "certified_public" {
+					user.Bio = ""
+				}
+				items = append(items, newRelationshipUserResponse(user))
 			}
 		}
 		hasMore := len(items) > 50
