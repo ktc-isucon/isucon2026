@@ -23,6 +23,17 @@ type pipelinedStmt struct {
 // 各文は別々の文なので、前の文で取った行ロックの後の新しいスナップショットで評価される。
 // scan はアプリ側で返す値を読むだけにし、エラーの判定は runPipelinedTx の後で行う。
 func runPipelinedTx(ctx context.Context, db *sqlx.DB, stmts ...pipelinedStmt) error {
+	return runPipelined(ctx, db, "BEGIN", stmts)
+}
+
+// runPipelinedSnapshot は読み取り専用の文を、同じスナップショット(REPEATABLE READ)で1回の往復にまとめて送る。
+// 後続の文で前の文と同じ条件をサブクエリで計算し直しても、同じ行の集合になる。
+// レプリカ(hot standby)でも使える(SERIALIZABLE は使えないが REPEATABLE READ は使える)。
+func runPipelinedSnapshot(ctx context.Context, db *sqlx.DB, stmts ...pipelinedStmt) error {
+	return runPipelined(ctx, db, "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY", stmts)
+}
+
+func runPipelined(ctx context.Context, db *sqlx.DB, begin string, stmts []pipelinedStmt) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
@@ -31,7 +42,7 @@ func runPipelinedTx(ctx context.Context, db *sqlx.DB, stmts ...pipelinedStmt) er
 	return conn.Raw(func(driverConn any) error {
 		pc := driverConn.(*stdlib.Conn).Conn()
 		batch := &pgx.Batch{}
-		batch.Queue("BEGIN")
+		batch.Queue(begin)
 		for _, s := range stmts {
 			batch.Queue(s.sql, s.args...)
 		}

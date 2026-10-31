@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 )
@@ -72,18 +73,101 @@ func getMemoriesByDateHandler(h *HandlerContext) echo.HandlerFunc {
 	}
 }
 
-func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, start, end time.Time, beforeAt *time.Time, beforeID string) (getMemoriesResponse, error) {
+// memoryPostsFrom は、メモリーズの対象の投稿を選ぶ FROM〜ORDER BY(LIMIT なし)。
+// 投稿・RealMoji・コメントの3文で同じ条件を使い、同じスナップショットで同じ投稿の集合を得る。
+const memoryPostsFrom = `
+  FROM posts p
+  JOIN posting_windows w ON w.id = p.posting_window_id
+  JOIN users u ON u.id = p.author_id AND u.status = 'active'
+  WHERE p.deleted_at IS NULL
+    AND p.author_id = $1 AND w.local_date >= $2 AND w.local_date < $3
+    AND ($4::timestamptz IS NULL OR (p.posted_at, p.id) < ($4, $5))
+  ORDER BY p.posted_at DESC, p.id DESC`
+
+func listMemories(ctx context.Context, db *sqlx.DB, userID string, start, end time.Time, beforeAt *time.Time, beforeID string) (getMemoriesResponse, error) {
 	var response getMemoriesResponse
 	if (beforeAt == nil) != (beforeID == "") {
 		return response, NewAPIError(http.StatusBadRequest, "invalid_pagination")
 	}
-	posts, err := selectPostsWithAuthor(ctx, db, `
-  AND p.author_id = $1 AND w.local_date >= $2 AND w.local_date < $3
-  AND ($4::timestamptz IS NULL OR (p.posted_at, p.id) < ($4, $5))
-  ORDER BY p.posted_at DESC, p.id DESC LIMIT 51
- `, userID, start, end, beforeAt, beforeID)
-	if err != nil {
+	// 投稿(最大51件)と、表示する50件分の RealMoji・コメントを、同じスナップショットで1回の往復で取得する
+	args := []any{userID, start, end, beforeAt, beforeID}
+	var posts []PostWithAuthor
+	var reactions []RealMojiWithReactor
+	var comments []CommentWithAuthor
+	if err := runPipelinedSnapshot(ctx, db,
+		pipelinedStmt{
+			sql:  `SELECT ` + postColumns + `, ` + prefixedUserColumns("u") + memoryPostsFrom + ` LIMIT 51`,
+			args: args,
+			scan: func(rows pgx.Rows) error {
+				for rows.Next() {
+					var post PostWithAuthor
+					if err := rows.Scan(append(postScanDest(&post.Post), userScanDest(&post.Author)...)...); err != nil {
+						return err
+					}
+					posts = append(posts, post)
+				}
+				return nil
+			},
+		},
+		pipelinedStmt{
+			sql: `
+  SELECT r.id, r.post_id, r.reactor_id, r.image_id, r.reaction_type, r.created_at, r.replaced_at, r.deleted_at, ` + prefixedUserColumns("ru") + `
+  FROM realmojis r JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
+  WHERE r.replaced_at IS NULL AND r.deleted_at IS NULL
+    AND r.post_id IN (SELECT p.id ` + memoryPostsFrom + ` LIMIT 50)
+  ORDER BY r.created_at DESC, r.id DESC`,
+			args: args,
+			scan: func(rows pgx.Rows) error {
+				for rows.Next() {
+					var reaction RealMojiWithReactor
+					r := &reaction.RealMoji
+					dest := []any{&r.ID, &r.PostID, &r.ReactorID, &r.ImageID, &r.ReactionType, &r.CreatedAt, &r.ReplacedAt, &r.DeletedAt}
+					if err := rows.Scan(append(dest, userScanDest(&reaction.Reactor)...)...); err != nil {
+						return err
+					}
+					reactions = append(reactions, reaction)
+				}
+				return nil
+			},
+		},
+		pipelinedStmt{
+			sql: `
+  SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, ` + prefixedUserColumns("cu") + `
+  FROM comments c JOIN users cu ON cu.id = c.author_id AND cu.status = 'active'
+  WHERE c.deleted_at IS NULL
+    AND c.post_id IN (SELECT p.id ` + memoryPostsFrom + ` LIMIT 50)
+  ORDER BY c.created_at, c.id`,
+			args: args,
+			scan: func(rows pgx.Rows) error {
+				for rows.Next() {
+					var comment CommentWithAuthor
+					cm := &comment.Comment
+					dest := []any{&cm.ID, &cm.PostID, &cm.AuthorID, &cm.Body, &cm.CreatedAt, &cm.DeletedAt}
+					if err := rows.Scan(append(dest, userScanDest(&comment.Author)...)...); err != nil {
+						return err
+					}
+					comments = append(comments, comment)
+				}
+				return nil
+			},
+		},
+	); err != nil {
 		return response, err
+	}
+	for i := range posts {
+		if err := posts[i].Author.setImageKey(); err != nil {
+			return response, err
+		}
+	}
+	for i := range reactions {
+		if err := reactions[i].Reactor.setImageKey(); err != nil {
+			return response, err
+		}
+	}
+	for i := range comments {
+		if err := comments[i].Author.setImageKey(); err != nil {
+			return response, err
+		}
 	}
 	if len(posts) > 50 {
 		prewarmPostSignatures(posts[:50])
@@ -102,32 +186,21 @@ func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, st
 	if response.HasMore {
 		items = items[:50]
 	}
-	if err := loadMemoryInteractions(ctx, db, items); err != nil {
-		return response, err
-	}
+	attachMemoryInteractions(items, reactions, comments)
 	response.Items = items
 	return response, nil
 }
 
-func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, items []memoryPostResponse) error {
+// attachMemoryInteractions は、取得済みの RealMoji とコメントを投稿ごとに最大50件ずつ付ける。
+func attachMemoryInteractions(items []memoryPostResponse, reactions []RealMojiWithReactor, comments []CommentWithAuthor) {
 	if len(items) == 0 {
-		return nil
+		return
 	}
-	postIDs := make([]string, len(items))
 	itemByPostID := make(map[string]*memoryPostResponse, len(items))
 	for i := range items {
-		postIDs[i] = items[i].ID
 		itemByPostID[items[i].ID] = &items[i]
 	}
 
-	query, args, err := sqlx.In(`AND r.post_id IN (?) ORDER BY r.created_at DESC, r.id DESC`, postIDs)
-	if err != nil {
-		return err
-	}
-	reactions, err := selectCurrentRealMojis(ctx, db, sqlx.Rebind(sqlx.DOLLAR, query), args...)
-	if err != nil {
-		return err
-	}
 	var targets imageSignatureTargets
 	perPost := make(map[string]int, len(items))
 	for _, reaction := range reactions {
@@ -140,19 +213,11 @@ func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, items [
 	targets.prewarm()
 	for _, reaction := range reactions {
 		item := itemByPostID[reaction.PostID]
-		if len(item.RealMojis) < 50 {
+		if item != nil && len(item.RealMojis) < 50 {
 			item.RealMojis = append(item.RealMojis, newRealMojiResponse(reaction.RealMoji, reaction.Reactor))
 		}
 	}
 
-	query, args, err = sqlx.In(`AND c.post_id IN (?) ORDER BY c.created_at, c.id`, postIDs)
-	if err != nil {
-		return err
-	}
-	comments, err := selectCommentsWithAuthor(ctx, db, sqlx.Rebind(sqlx.DOLLAR, query), args...)
-	if err != nil {
-		return err
-	}
 	targets = imageSignatureTargets{}
 	clear(perPost)
 	for _, comment := range comments {
@@ -164,11 +229,10 @@ func loadMemoryInteractions(ctx context.Context, db sqlx.QueryerContext, items [
 	targets.prewarm()
 	for _, comment := range comments {
 		item := itemByPostID[comment.PostID]
-		if len(item.Comments) < 50 {
+		if item != nil && len(item.Comments) < 50 {
 			item.Comments = append(item.Comments, newCommentResponse(comment.Comment, comment.Author))
 		}
 	}
-	return nil
 }
 
 // imageSignatureTargets は、応答の組み立てで signedImageURL が計算する署名の (鍵, 画像ID) を重複なく集める。
