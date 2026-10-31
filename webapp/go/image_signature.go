@@ -66,12 +66,21 @@ func imageSignature(key []byte, imageID string, exp int64) []byte {
 
 func computeImageSignature(key []byte, imageID string, exp int64) []byte {
 	value := []byte(strconv.FormatInt(exp, 10) + ":" + imageID)
-	for range imageSignatureIterations {
-		mac := hmac.New(sha256.New, key)
-		mac.Write(value)
-		value = mac.Sum(nil)
+	// hmac.New をループの外で1回だけ作り、Reset で使い回す。
+	// crypto/hmac は Reset 時に鍵の前処理(ipad/opad)済みの状態を復元するので、毎回の鍵処理が不要になる。
+	// 入力と出力を別の固定バッファで交互に使い、アロケーションも避ける。
+	mac := hmac.New(sha256.New, key)
+	var bufA, bufB [sha256.Size]byte
+	in, out := bufA[:0], bufB[:0]
+	mac.Write(value)
+	in = mac.Sum(in)
+	for range imageSignatureIterations - 1 {
+		mac.Reset()
+		mac.Write(in)
+		out = mac.Sum(out[:0])
+		in, out = out, in
 	}
-	return value
+	return append([]byte(nil), in...)
 }
 
 func signedImageURL(user User, imageID string) string {
