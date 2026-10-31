@@ -102,7 +102,7 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 					return nil
 				},
 			},
-			postsWithAuthorStmt(postConditions, &posts, viewerID, beforePostedAt, beforeID),
+			feedPostsWithAuthorStmt(postConditions, &posts, viewerID, beforePostedAt, beforeID),
 		}
 		if ranked {
 			stmts = append(stmts, recommendationRowsStmt(conditions, &scoreRows, viewerID, beforePostedAt, beforeID))
@@ -180,14 +180,36 @@ func rankedBefore(score int64, post Post, beforeScore int64, beforePostedAt time
 	return post.ID < beforeID
 }
 
-// feedFriendIDsSQL は閲覧者($1)の友達のIDを返すサブクエリ(loadViewerContext の Friends と同じ)。
-const feedFriendIDsSQL = `(SELECT CASE WHEN fr.user_low_id = $1 THEN fr.user_high_id ELSE fr.user_low_id END
-     FROM friendships fr WHERE fr.user_low_id = $1 OR fr.user_high_id = $1)`
+// feedViewerSetCTEs は、閲覧者($1)の友達(feed_friends)と、友達と友達関係にある相手(feed_fofs)を
+// 1回だけ求める CTE(WITH に続ける)。loadViewerContext の Friends / FriendsOfFriends と同じ集合。
+// 以前は条件の中で友達の友達のサブクエリを入れ子にしていたため、投稿ごとに friendships を何度も読んでいた。
+// 両方向とも、(user_low_id, user_high_id) の UNIQUE と friendships_user_high_id のインデックスで引く。
+const feedViewerSetCTEs = `feed_friends AS MATERIALIZED (
+    SELECT fr.user_high_id AS id FROM friendships fr WHERE fr.user_low_id = $1
+    UNION ALL
+    SELECT fr.user_low_id FROM friendships fr WHERE fr.user_high_id = $1
+  ), feed_fofs AS MATERIALIZED (
+    SELECT fs.user_high_id AS id FROM friendships fs JOIN feed_friends f ON fs.user_low_id = f.id
+    UNION ALL
+    SELECT fs.user_low_id FROM friendships fs JOIN feed_friends f ON fs.user_high_id = f.id
+  )`
 
-// feedFriendOfFriendIDsSQL は閲覧者の友達と友達関係にある相手のIDを返すサブクエリ(loadViewerContext の FriendsOfFriends と同じ)。
-const feedFriendOfFriendIDsSQL = `(SELECT fs.user_high_id FROM friendships fs WHERE fs.user_low_id IN ` + feedFriendIDsSQL + `
-     UNION ALL
-     SELECT fs.user_low_id FROM friendships fs WHERE fs.user_high_id IN ` + feedFriendIDsSQL + `)`
+// 集合への所属は「= ANY (ARRAY(...))」で判定する。ARRAY(...) は InitPlan として1回だけ計算され、
+// PG16 では大きな配列との比較をハッシュで行う。IN (サブクエリ) のままだと、プランナーが集合を起点に
+// 投稿を作者のインデックスで引く計画を選び、終わった投稿期間の投稿まで読んでしまうことがある。
+// 値に NULL はなく、空の配列でも IN / NOT IN と同じ結果になる(= ANY('{}') は false、<> ALL('{}') は true)。
+const (
+	feedAuthorIsFriendSQL    = `p.author_id = ANY (ARRAY(SELECT id FROM feed_friends))`
+	feedAuthorIsNotFriendSQL = `p.author_id <> ALL (ARRAY(SELECT id FROM feed_friends))`
+	feedAuthorIsFoFSQL       = `p.author_id = ANY (ARRAY(SELECT id FROM feed_fofs))`
+)
+
+// feedPostsWithAuthorStmt は、feedCandidateConditions の条件で投稿と投稿者を読む(閲覧者の集合の CTE を前に付ける)。
+func feedPostsWithAuthorStmt(conditions string, posts *[]PostWithAuthor, args ...any) pipelinedStmt {
+	stmt := postsWithAuthorStmt(conditions, posts, args...)
+	stmt.sql = `WITH ` + feedViewerSetCTEs + stmt.sql
+	return stmt
+}
 
 // feedCandidateConditions は、フィードの候補の投稿を絞る条件(posts p, posting_windows w, users u の WHERE に続ける)。
 // $1 は閲覧者、$2/$3 はページングのカーソル。canView と matchesFeed と同じ判定を SQL で行う。
@@ -199,9 +221,9 @@ func feedCandidateConditions(feed string) string {
 	case "following":
 		feedRule = `p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)`
 	case "friends":
-		feedRule = `p.author_id IN ` + feedFriendIDsSQL
+		feedRule = feedAuthorIsFriendSQL
 	case "friends-of-friends":
-		feedRule = `p.author_id NOT IN ` + feedFriendIDsSQL + ` AND p.author_id IN ` + feedFriendOfFriendIDsSQL
+		feedRule = feedAuthorIsNotFriendSQL + ` AND ` + feedAuthorIsFoFSQL
 	default:
 		feedRule = `false`
 	}
@@ -220,8 +242,8 @@ func feedCandidateConditions(feed string) string {
                    WHERE (b.blocker_id = $1 AND b.blocked_id = p.author_id) OR (b.blocker_id = p.author_id AND b.blocked_id = $1))
    -- 公開範囲(canView と同じ)
    AND (p.visibility = 'public'
-        OR (p.visibility = 'friends' AND p.author_id IN ` + feedFriendIDsSQL + `)
-        OR (p.visibility = 'friends_of_friends' AND (p.author_id IN ` + feedFriendIDsSQL + ` OR p.author_id IN ` + feedFriendOfFriendIDsSQL + `)))
+        OR (p.visibility = 'friends' AND ` + feedAuthorIsFriendSQL + `)
+        OR (p.visibility = 'friends_of_friends' AND (` + feedAuthorIsFriendSQL + ` OR ` + feedAuthorIsFoFSQL + `)))
    AND ` + feedRule
 }
 
@@ -238,7 +260,7 @@ type recommendationRow struct {
 func recommendationRowsStmt(conditions string, rows *[]recommendationRow, args ...any) pipelinedStmt {
 	return pipelinedStmt{
 		sql: `
-  WITH cand AS (
+  WITH ` + feedViewerSetCTEs + `, cand AS (
     SELECT p.id, p.author_id
     FROM posts p
     JOIN posting_windows w ON w.id = p.posting_window_id
