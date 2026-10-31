@@ -110,16 +110,15 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
 		ctx := c.Request().Context()
-		allowed, err := canComment(ctx, h.ReadDB(c), GetSession(c).UserID, input.PostID)
+		// 投稿・閲覧者・コメントを1回の往復で読み、コメントできるかで捨てるかを決める
+		var comments []CommentWithAuthor
+		post, postFound, viewer, viewerFound, err := loadPostAndViewer(ctx, h.ReadDB(c), input.PostID, GetSession(c).UserID,
+			commentsWithAuthorStmt(`AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3)) ORDER BY c.created_at,c.id LIMIT 51`, &comments, input.PostID, input.AfterCreatedAt, input.AfterID))
 		if err != nil {
 			return err
 		}
-		if !allowed {
+		if !canCommentOn(post, postFound, viewer, viewerFound) {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		comments, err := selectCommentsWithAuthor(ctx, h.ReadDB(c), `AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3)) ORDER BY c.created_at,c.id LIMIT 51`, input.PostID, input.AfterCreatedAt, input.AfterID)
-		if err != nil {
-			return err
 		}
 		items := make([]createCommentResponse, 0, len(comments))
 		for _, comment := range comments {

@@ -1,10 +1,7 @@
 package isureal
 
 import (
-	"database/sql"
-	"errors"
 	"net/http"
-	"slices"
 	"strings"
 
 	"github.com/labstack/echo/v5"
@@ -118,25 +115,38 @@ func getUserHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		viewer := GetSession(c).UserID
-		user, err := getUser(ctx, h.ReadDB(c), input.UserID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "relationship_not_found")
-		}
-		if err != nil {
+		// ユーザー・ブロック・友達かを1回の往復で読む(getUser, isBlocked, getFriendIDs と同じ条件)
+		var user User
+		var found, blocked, friend bool
+		if err := runPipelinedSnapshot(ctx, h.ReadDB(c),
+			pipelinedStmt{
+				sql:  `SELECT ` + strings.Join(userColumns, ", ") + ` FROM users WHERE id = $1 AND status = 'active'`,
+				args: []any{input.UserID},
+				scan: scanFirstRow(&found, userScanDest(&user)...),
+			},
+			pipelinedStmt{
+				sql:  `SELECT EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1))`,
+				args: []any{viewer, input.UserID},
+				scan: scanFirstRow(new(bool), &blocked),
+			},
+			pipelinedStmt{
+				sql:  `SELECT EXISTS(SELECT 1 FROM friendships WHERE (user_low_id=$1 AND user_high_id=$2) OR (user_low_id=$2 AND user_high_id=$1))`,
+				args: []any{viewer, input.UserID},
+				scan: scanFirstRow(new(bool), &friend),
+			},
+		); err != nil {
 			return err
 		}
-		blocked, err := isBlocked(ctx, h.ReadDB(c), viewer, user.ID)
-		if err != nil {
+		if !found {
+			return NewAPIError(http.StatusNotFound, "relationship_not_found")
+		}
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		if blocked {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
-		friends, err := getFriendIDs(ctx, h.ReadDB(c), viewer)
-		if err != nil {
-			return err
-		}
-		if user.AccountType != "certified_public" && !slices.Contains(friends, user.ID) {
+		if user.AccountType != "certified_public" && !friend {
 			user.Bio = ""
 		}
 		return c.JSON(http.StatusOK, getUserResponse(newRelationshipUserResponse(user)))

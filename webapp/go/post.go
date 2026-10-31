@@ -4,9 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -103,71 +100,14 @@ type viewerContext struct {
 	Blocked          map[string]bool
 }
 
+// loadViewerContext はユーザー・当日投稿の有無・ブロック・友達・友達の友達を1往復で取得する
+// (SQL は viewerContextSQL。バッチで送る場合は viewerStmt を使う)
 func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerContext, error) {
-	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, Blocked: map[string]bool{}, MutualFriends: map[string]int{}}
-	// ユーザー・当日投稿の有無・ブロック・友達・友達の友達を1往復で取得する
-	// (IDはUUIDなので ',' と ':' を区切りに使える)
-	var row struct {
-		User
-		HasPostedToday bool   `db:"has_posted_today"`
-		BlockedIDs     string `db:"blocked_ids"`
-		FriendIDs      string `db:"friend_ids"`
-		// 友達の友達ごとの「共通の友達の数」("id:count" を ',' で連結)
-		FriendOfFriendCounts string `db:"fof_counts"`
+	var row viewerRow
+	if err := sqlx.GetContext(ctx, db, &row, viewerContextSQL, viewerID); err != nil {
+		return viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, Blocked: map[string]bool{}, MutualFriends: map[string]int{}}, err
 	}
-	if err := sqlx.GetContext(ctx, db, &row, `
-  WITH f AS (
-    SELECT CASE WHEN user_low_id = $1 THEN user_high_id ELSE user_low_id END AS id
-    FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
-  )
-  SELECT `+prefixedUserColumns("u")+`,
-    EXISTS(
-      SELECT 1 FROM posts p
-      JOIN posting_windows posted ON posted.id = p.posting_window_id
-      JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
-                                  AND current.local_date = posted.local_date
-      WHERE p.author_id = u.id AND p.deleted_at IS NULL
-    ) AS has_posted_today,
-    COALESCE((SELECT string_agg(CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END, ',')
-              FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1), '') AS blocked_ids,
-    COALESCE((SELECT string_agg(id, ',') FROM f), '') AS friend_ids,
-    -- 友達 f と友達関係にある相手ごとに、何人の友達とつながっているかを数える。
-    -- (low, high) の両方向をインデックスで結合する(OR で全件走査しない)。両端が友達のペアは両方向で数える
-    COALESCE((SELECT string_agg(other || ':' || n, ',')
-              FROM (
-                SELECT other, count(*) AS n FROM (
-                  SELECT fs.user_high_id AS other FROM f JOIN friendships fs ON fs.user_low_id = f.id
-                  UNION ALL
-                  SELECT fs.user_low_id AS other FROM f JOIN friendships fs ON fs.user_high_id = f.id
-                ) x GROUP BY other
-              ) c), '') AS fof_counts
-  FROM users u WHERE u.id = $1 AND u.status = 'active'
- `, viewerID); err != nil {
-		return viewer, err
-	}
-	viewer.User = row.User
-	if err := viewer.User.setImageKey(); err != nil {
-		return viewer, err
-	}
-	viewer.HasPostedToday = row.HasPostedToday
-	for _, id := range splitIDs(row.BlockedIDs) {
-		viewer.Blocked[id] = true
-	}
-	for _, id := range splitIDs(row.FriendIDs) {
-		viewer.Friends[id] = true
-	}
-	for _, entry := range splitIDs(row.FriendOfFriendCounts) {
-		other, count, _ := strings.Cut(entry, ":")
-		n, err := strconv.Atoi(count)
-		if err != nil {
-			return viewer, fmt.Errorf("invalid friend-of-friend count %q: %w", entry, err)
-		}
-		viewer.FriendsOfFriends[other] = true
-		if other != viewer.ID {
-			viewer.MutualFriends[other] += n
-		}
-	}
-	return viewer, nil
+	return row.toViewerContext()
 }
 
 func (viewer viewerContext) canView(post Post) bool {
