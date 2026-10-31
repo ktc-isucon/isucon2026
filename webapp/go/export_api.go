@@ -27,13 +27,15 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		var posts []struct {
 			Post
-			ImageCreatedAt time.Time `db:"image_created_at"`
+			PostCreatedAt time.Time `db:"post_created_at"`
 		}
+		// 投稿は作成時に必ず新しい画像を作り、投稿の画像は消されないので、画像が初期データかどうかは
+		// 投稿が初期データかどうか(created_at と initial_data_boundary の比較)と一致する。
+		// image_objects はパーティション分割されていて id だけで結合すると全パーティションを探すため、結合しない
 		if err := h.ReadDB(c).SelectContext(ctx, &posts, `
-   SELECT `+postColumns+`, i.created_at AS image_created_at
+   SELECT `+postColumns+`, p.created_at AS post_created_at
    FROM posts p
    JOIN posting_windows w ON w.id = p.posting_window_id
-   JOIN image_objects i ON i.id = p.image_id
    WHERE p.author_id = $1 AND p.deleted_at IS NULL
    ORDER BY p.posted_at, p.id
   `, userID); err != nil {
@@ -55,7 +57,7 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 		})
 		for i, post := range posts {
 			eg.Go(func() error {
-				kind, err := imageKind(ctx, h.ReadDB(c), post.ImageCreatedAt)
+				kind, err := imageKind(ctx, h.ReadDB(c), post.PostCreatedAt)
 				if err != nil {
 					return err
 				}

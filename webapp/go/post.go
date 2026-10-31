@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -110,7 +112,8 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
 		HasPostedToday bool   `db:"has_posted_today"`
 		BlockedIDs     string `db:"blocked_ids"`
 		FriendIDs      string `db:"friend_ids"`
-		FriendPairs    string `db:"friend_pairs"`
+		// 友達の友達ごとの「共通の友達の数」("id:count" を ',' で連結)
+		FriendOfFriendCounts string `db:"fof_counts"`
 	}
 	if err := sqlx.GetContext(ctx, db, &row, `
   WITH f AS (
@@ -128,9 +131,16 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
     COALESCE((SELECT string_agg(CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END, ',')
               FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1), '') AS blocked_ids,
     COALESCE((SELECT string_agg(id, ',') FROM f), '') AS friend_ids,
-    COALESCE((SELECT string_agg(fs.user_low_id || ':' || fs.user_high_id, ',')
-              FROM friendships fs
-              WHERE fs.user_low_id IN (SELECT id FROM f) OR fs.user_high_id IN (SELECT id FROM f)), '') AS friend_pairs
+    -- 友達 f と友達関係にある相手ごとに、何人の友達とつながっているかを数える。
+    -- (low, high) の両方向をインデックスで結合する(OR で全件走査しない)。両端が友達のペアは両方向で数える
+    COALESCE((SELECT string_agg(other || ':' || n, ',')
+              FROM (
+                SELECT other, count(*) AS n FROM (
+                  SELECT fs.user_high_id AS other FROM f JOIN friendships fs ON fs.user_low_id = f.id
+                  UNION ALL
+                  SELECT fs.user_low_id AS other FROM f JOIN friendships fs ON fs.user_high_id = f.id
+                ) x GROUP BY other
+              ) c), '') AS fof_counts
   FROM users u WHERE u.id = $1 AND u.status = 'active'
  `, viewerID); err != nil {
 		return viewer, err
@@ -146,19 +156,15 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
 	for _, id := range splitIDs(row.FriendIDs) {
 		viewer.Friends[id] = true
 	}
-	for _, pair := range splitIDs(row.FriendPairs) {
-		low, high, _ := strings.Cut(pair, ":")
-		if viewer.Friends[low] {
-			viewer.FriendsOfFriends[high] = true
-			if high != viewer.ID {
-				viewer.MutualFriends[high]++
-			}
+	for _, entry := range splitIDs(row.FriendOfFriendCounts) {
+		other, count, _ := strings.Cut(entry, ":")
+		n, err := strconv.Atoi(count)
+		if err != nil {
+			return viewer, fmt.Errorf("invalid friend-of-friend count %q: %w", entry, err)
 		}
-		if viewer.Friends[high] {
-			viewer.FriendsOfFriends[low] = true
-			if low != viewer.ID {
-				viewer.MutualFriends[low]++
-			}
+		viewer.FriendsOfFriends[other] = true
+		if other != viewer.ID {
+			viewer.MutualFriends[other] += n
 		}
 	}
 	return viewer, nil
