@@ -33,9 +33,19 @@ func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string)
 	if err != nil {
 		return nil, err
 	}
-	// 2人分のロックを1往復で取る。ORDER BY id でロック順を固定しデッドロックを避ける
+	// 2人分のロックを1往復で取る。
+	// - 同じ2人の間の操作(友達リクエスト・フォロー・ブロック)は、ペア単位のadvisory lockで直列にする
+	// - users行は FOR SHARE: 退会(UPDATE)やコメント等の FOR NO KEY UPDATE とは衝突させつつ、
+	//   別のペアの関係操作どうしでは同じユーザーを取り合わない
+	// advisory lockはInitPlan(LockRowsより下のOne-Time Filter)で評価され、必ず行ロックより先に取られる。
+	// ORDER BY id で行ロックの順も固定し、デッドロックを避ける
 	var lockedIDs []string
-	if err := tx.SelectContext(ctx, &lockedIDs, `SELECT id FROM users WHERE id IN ($1, $2) AND status='active' ORDER BY id FOR NO KEY UPDATE`, min(actor, target), max(actor, target)); err != nil {
+	if err := tx.SelectContext(ctx, &lockedIDs, `
+  SELECT id FROM users
+  WHERE id IN ($1, $2) AND status = 'active'
+    AND (SELECT count(*) FROM (SELECT pg_advisory_xact_lock(hashtextextended('relationship:' || $1 || ':' || $2, 0))) l) = 1
+  ORDER BY id FOR SHARE
+ `, min(actor, target), max(actor, target)); err != nil {
 		tx.Rollback()
 		return nil, err
 	}
