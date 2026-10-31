@@ -146,6 +146,8 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		); err != nil {
 			return err
 		}
+		// コミット済み。今日の投稿と投稿数が変わりうるので、本人のキャッシュを消す
+		userViews.invalidateUser(userID)
 		if !userFound {
 			return sql.ErrNoRows
 		}
@@ -186,6 +188,14 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
+		cached, epoch := userViews.begin(userID)
+		if cached.myPost != nil {
+			if !cached.myPost.found {
+				return NewAPIError(http.StatusNotFound, "post_not_found")
+			}
+			post := cached.myPost.post
+			return c.JSON(http.StatusOK, getMyCurrentPostResponse(newPostResponse(post.Post, post.Author)))
+		}
 		// 投稿IDの特定・投稿・投稿者の取得を1往復にまとめる
 		var post PostWithAuthor
 		err := h.ReadDB(c).GetContext(ctx, &post, `
@@ -197,6 +207,7 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
    WHERE p.author_id = $1 AND p.deleted_at IS NULL
   `, userID)
 		if errors.Is(err, sql.ErrNoRows) {
+			userViews.putMyPost(epoch, userID, cachedMyPost{found: false})
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}
 		if err != nil {
@@ -205,6 +216,8 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := post.Author.setImageKey(); err != nil {
 			return err
 		}
+		// 署名付きURLは exp が変わるのでキャッシュせず、応答のたびに作る
+		userViews.putMyPost(epoch, userID, cachedMyPost{found: true, post: post})
 		return c.JSON(http.StatusOK, getMyCurrentPostResponse(newPostResponse(post.Post, post.Author)))
 	}
 }
@@ -307,6 +320,7 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		userViews.invalidateUser(user.ID)
 		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(post, user)))
 	}
 }
@@ -363,6 +377,7 @@ func deletePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		userViews.invalidateUser(userID)
 		return c.NoContent(http.StatusNoContent)
 	}
 }

@@ -182,6 +182,10 @@ func getMeHandler(h *HandlerContext) echo.HandlerFunc {
 		if session == nil {
 			return NewAPIError(http.StatusUnauthorized, "invalid_session")
 		}
+		cached, epoch := userViews.begin(session.UserID)
+		if cached.me != nil {
+			return c.JSON(http.StatusOK, newGetMeResponse(*cached.me))
+		}
 		user, err := getUser(c.Request().Context(), h.ReadDB(c), session.UserID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
@@ -189,6 +193,7 @@ func getMeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		userViews.putMe(epoch, session.UserID, user)
 		return c.JSON(http.StatusOK, newGetMeResponse(user))
 	}
 }
@@ -247,6 +252,7 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		if input.Region != nil {
 			sessions.invalidateUser(session.UserID)
 		}
+		userViews.invalidateUser(session.UserID)
 		return c.JSON(http.StatusOK, updateMeResponse(newGetMeResponse(user)))
 	}
 }

@@ -39,6 +39,7 @@ func deleteAccountHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		sessions.invalidateUser(userID)
+		userViews.invalidateUser(userID)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
