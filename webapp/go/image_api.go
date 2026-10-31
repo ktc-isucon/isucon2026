@@ -94,6 +94,8 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		// 画像本体はnginxが返す(isu0〜2は初期データの画像を手元にキャッシュし、それ以外はisu3から取得する)
+		// 成功時だけブラウザにキャッシュさせる。投稿削除後の取得禁止(5秒の猶予)に収まるよう5秒にする
+		c.Response().Header().Set("Cache-Control", "private, max-age=5")
 		c.Response().Header().Set("X-Accel-Redirect", "/_img/"+imageRelPath(kind, input.ImageID))
 		c.Response().Header().Set(echo.HeaderContentType, "image/jpeg")
 		return c.NoContent(http.StatusOK)
