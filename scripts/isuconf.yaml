@@ -1,0 +1,23 @@
+remote:
+  servers:
+    - host: isu0
+    - host: isu1
+    - host: isu2
+  user: isucon
+local:
+  config_root_path: ../etc
+targets:
+  - path: /etc/nginx/nginx.conf
+    sudo: true
+  - path: /etc/nginx/sites-enabled/isucon.conf
+    sudo: true
+  - path: /etc/mysql
+    sudo: true
+  - path: /etc/systemd/system/isu-go.service
+    sudo: true
+  - path: /usr/lib/systemd/system/mysql.service
+    sudo: true
+  - path: /usr/lib/systemd/system/nginx.service
+    sudo: true
+  - path: /etc/ssh/sshd_config
+    sudo: true

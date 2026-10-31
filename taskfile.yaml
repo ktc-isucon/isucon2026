@@ -1,0 +1,657 @@
+version: "3"
+vars:
+  REPOSITORY_NAME: ktc-isucon/isucon-template
+  DEFAULT_BRANCH: main
+  SERVER_ADDRESSES: "localhost localhost localhost"
+  USER_NAME: isucon
+
+  APP_SERVICE_NAME: isu-go.service
+  APP_SRC_DIR: private_isu/webapp/golang
+  DEPLOY_APP_SERVER_NAMES: "isu0 isu1 isu2"
+  APP_BUILD_CMD: "make"
+
+  NGINX_SERVICE_NAME: nginx.service
+  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2"
+
+  MYSQL_SERVICE_NAME: mysql.service
+  MYSQL_USER_NAME: isuconp
+  MYSQL_USER_PASSWORD: isuconp
+  DEPLOY_MYSQL_SERVER_NAMES: "isu0 isu1 isu2"
+  MYSQL_DATABASE_NAME: isupipe
+
+  ACCESS_LOG_FILE: "/var/log/nginx/access.log"
+  SLOW_QUERY_LOG_FILE: "/var/log/mysql/mysql-slow.log"
+  TRUNCATE_LOG_FILE: "{{.ACCESS_LOG_FILE}} {{.SLOW_QUERY_LOG_FILE}}"
+
+  SSH_REPOSITORY_URL: "ssh://github.com/{{ .REPOSITORY_NAME }}.git"
+  ALL_SERVER_NAMES:
+    sh: |
+      SERVER_NAMES=()
+      # 配列に変換
+      SERVER_ADDRESSES=({{.SERVER_ADDRESSES}})
+      LENGTH=${#SERVER_ADDRESSES[@]}
+      for i in $(seq 0 $(($LENGTH - 1))); do
+        SERVER_NAMES+=("isu${i}")
+      done
+      # Join names with comma
+      echo ${SERVER_NAMES[@]}
+
+tasks:
+  init:
+    desc: "ローカル環境での実行に必要なツールをインストールします"
+    platform: darwin
+    dir: ./scripts
+    cmds:
+      - |
+        archive_file="isuconf-aarch64-apple-darwin"
+        if [ $ARCH = "x86_64" ]; then
+          archive_file="isuconf-x86_64-apple-darwin"
+        fi
+        archive_url="https://github.com/Penpen7/isuconf/releases/download/0.2.7/$archive_file.zip"
+        curl -L $archive_url -o isuconf.zip
+        unzip -o isuconf.zip $archive_file
+        mv $archive_file isuconf
+        rm -f isuconf.zip
+      - |
+        archive_file="isucrud_Darwin_arm64.tar.gz"
+        if [ $ARCH = "x86_64" ]; then
+          archive_file="isucrud_Darwin_x86_64.tar.gz"
+        fi
+        archive_url="https://github.com/mazrean/isucrud/releases/download/v1.4.0/$archive_file"
+        curl -L $archive_url -o isucrud.tar.gz
+        tar xzvf isucrud.tar.gz isucrud
+        rm -f isucrud.tar.gz
+    env:
+      ARCH:
+        sh: uname -m
+
+  init:server:
+    desc: "サーバの初期設定に必要なタスクをまとめて行います"
+    cmds:
+      - task: init:ssh
+      - task: init:server:tools
+      - task: init:server:git
+
+  init:ssh:
+    desc: "サーバにSSH接続するための~/.ssh/configを設定します"
+    prompt: "既存の~/.ssh/configを上書きしますか？"
+    cmds:
+      - cmd: |
+          # すでに~/.ssh/configが存在する場合はバックアップを取る
+          if [ -f ~/.ssh/config ]; then
+            cp ~/.ssh/config ~/.ssh/config.bak`date "+%Y%m%d%H%M%S"`
+          fi
+
+          ssh_config=""
+          # 配列に変換
+          SERVER_ADDRESSES=({{.SERVER_ADDRESSES}}) 
+          for i in $(seq 0 $((${#SERVER_ADDRESSES[@]} - 1))); do
+            ssh_config+="Host isu${i}${LF}"
+            ssh_config+="  HostName ${SERVER_ADDRESSES[$i]}${LF}"
+            ssh_config+="  User {{.USER_NAME}}${LF}"
+            ssh_config+="${LF}"
+          done
+          echo -e "$ssh_config" > ~/.ssh/config
+    env:
+      LF: "\n"
+
+  init:pprotein:
+    desc: "pprofを使用するための設定を表示します"
+    cmds:
+      - cmd: |
+          json=""
+          SERVER_ADDRESSES=({{.SERVER_ADDRESSES}})
+          for i in $(seq 0 $((${#SERVER_ADDRESSES[@]} - 1))); do
+            json+="
+              {
+                \"Type\": \"pprof\",
+                \"Label\": \"isu$i\",
+                \"URL\": \"http://${SERVER_ADDRESSES[$i]}/debug/pprof/profile\",
+                \"Duration\": 90
+              },
+              {
+                \"Type\": \"httplog\",
+                \"Label\": \"isu$i\",
+                \"URL\": \"http://${SERVER_ADDRESSES[$i]}/debug/log/httplog\",
+                \"Duration\": 90
+              },
+              {
+                \"Type\": \"slowlog\",
+                \"Label\": \"isu$i\",
+                \"URL\": \"http://${SERVER_ADDRESSES[$i]}/debug/log/slowlog\",
+                \"Duration\": 90
+              },"
+          done
+          json="[${json%,}
+          ]"
+          echo "$json"
+          echo "クリップボードにコピーしました"
+          echo "$json" | pbcopy
+
+  init:server:tools:
+    desc: "サーバ上での実行に必要なツールをインストールします"
+    dir: ./scripts
+    cmds:
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssh="ssh {{.SERVER_NAME}}"
+
+          # arm64かamd64かを判定
+          arch=$($ssh "uname -m" 2>/dev/null)
+          alp_archive=""
+          tbls_archive=""
+          if [ "$arch" = "aarch64" ]; then
+            alp_archive=alp_linux_arm64.tar.gz
+            tbls_archive=tbls_{{.TBLS_VERSION}}_linux_arm64.tar.gz
+          else
+            alp_archive=alp_linux_amd64.tar.gz
+            tbls_archive=tbls_{{.TBLS_VERSION}}_linux_amd64.tar.gz
+          fi
+
+          # install alp
+          $ssh "rm -f $alp_archive"
+          $ssh "wget https://github.com/tkuchiki/alp/releases/download/{{.ALP_VERSION}}/$alp_archive"
+          $ssh "tar xzvf $alp_archive"
+          $ssh "rm -f $alp_archive"
+          $ssh "sudo mv alp /usr/local/bin/"
+
+          # install tbls
+          $ssh "rm -f $tbls_archive"
+          $ssh "wget https://github.com/k1LoW/tbls/releases/download/{{.TBLS_VERSION}}/$tbls_archive"
+          $ssh "tar xzvf $tbls_archive" tbls
+          $ssh "rm -f $tbls_archive"
+          $ssh "sudo mv tbls /usr/local/bin/"
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssh="ssh {{.SERVER_NAME}}"
+          $ssh "sudo DEBIAN_FRONTEND=noninteractive apt update -y"
+          $ssh "sudo DEBIAN_FRONTEND=noninteractive apt install percona-toolkit -y"
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssh="ssh {{.SERVER_NAME}}"
+
+          # arm64かamd64かを判定
+          arch=$($ssh "uname -m" 2>/dev/null)
+          go_archive=""
+          if [ "$arch" = "aarch64" ]; then
+            go_archive=go{{.GO_VERSION}}.linux-arm64.tar.gz
+          else
+            go_archive=go{{.GO_VERSION}}.linux-amd64.tar.gz
+          fi
+
+          $ssh "rm -f $go_archive"
+          $ssh "wget https://go.dev/dl/$go_archive"
+          $ssh "sudo tar -C /usr/local -xzf $go_archive"
+          $ssh "rm -f $go_archive"
+          $ssh "sudo ln -s -f /usr/local/go/bin/go /usr/local/bin/go"
+          $ssh "sudo ln -s -f /usr/local/go/bin/gofmt /usr/local/bin/gofmt"
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssh="ssh {{.SERVER_NAME}}"
+
+          # utils
+          $ssh "sudo DEBIAN_FRONTEND=noninteractive apt install build-essential dstat htop silversearcher-ag tree -y"
+    vars:
+      ALP_VERSION: v1.0.21
+      TBLS_VERSION: v1.79.4
+      GO_VERSION: 1.21.4
+
+  init:server:git:
+    desc: "サーバ上でgitリポジトリを初期化します"
+    cmds:
+      - cmd: |
+          echo "ℹ️ Create a deploy key for {{.REPOSITORY_NAME}}"
+          mkdir -p ~/.ssh/{{.REPOSITORY_NAME}}
+          ssh-keygen -t ed25519 -C "for {{.REPOSITORY_NAME}}" -N "" -f {{.PRIVATE_KEY_PATH}}          
+          echo "✅ Done"
+
+          echo "ℹ️ Add a deploy key for {{.REPOSITORY_NAME}}"
+          gh repo deploy-key add {{.PUBLIC_KEY_PATH}} --repo {{.REPOSITORY_NAME}} -w --title "for {{.REPOSITORY_NAME}}"
+          echo "✅ Done"
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          scp {{.PRIVATE_KEY_PATH}} {{.SERVER_NAME}}:~/.ssh/id_ed25519
+          ssh -t {{.SERVER_NAME}} "chmod 600 ~/.ssh/id_ed25519"
+      - for: { var: ALL_SERVER_NAMES }
+        cmd: |
+          ssht="ssh -t {{.USER_NAME}}@{{ .ITEM }}"
+
+          $ssht 'echo -e "Host github.com\n\tStrictHostKeyChecking no\n\tUser git" > ~/.ssh/config'
+          $ssht "git config --global user.email 'isucon@example.com'"
+          $ssht "git config --global user.name 'isucon'"
+          $ssht "git init --initial-branch {{.DEFAULT_BRANCH}}"
+
+          # originが設定されている場合は削除
+          $ssht "git remote remove origin || true"
+          $ssht "git remote add origin {{.SSH_REPOSITORY_URL}}"
+          $ssht "git pull origin {{.DEFAULT_BRANCH}}"
+    vars:
+      PRIVATE_KEY_PATH: ~/.ssh/{{.REPOSITORY_NAME}}/id_ed25519
+      PUBLIC_KEY_PATH: ~/.ssh/{{.REPOSITORY_NAME}}/id_ed25519.pub
+
+  push:all:
+    desc: "サーバ上にファイルを配置し、サービスを再起動します(現在のブランチ)"
+    dir: ./scripts
+    prompt: "現在の{{.GIT_BRANCH}}ブランチの内容をサーバ({{.SERVER_NAMES}})に反映します。\n(異なるブランチの場合はgit switchし、サーバを指定したい場合はtask push -- isu0と引数に設定してください)\n設定ファイル以外はリモートレポジトリに反映されていなければ反映されません。\n実行しますか？"
+    cmds:
+      - cmd: |
+          SERVER_NAME="{{.SERVER_NAMES}}"
+          if [ -z "$SERVER_NAME" ]; then
+            exit 1
+          fi
+      - task: sync:etc
+        vars:
+          SERVER_NAME: "{{.SERVER_NAMES}}"
+      - task: push:app
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+      - task: restart
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS }}"
+      GIT_BRANCH:
+        sh: git branch --show-current
+
+  push:all:main:
+    desc: サーバー上にファイルを配置し、サービスを再起動します({{.DEFAULT_BRANCH}}ブランチ)
+    prompt: "{{.DEFAULT_BRANCH}}ブランチの内容を反映する際に差分をなくすため、git stashを実行します。それでもよろしいですか？"
+    dir: ./scripts
+    cmds:
+      - cmd: |
+          git stash
+          git fetch
+          git switch {{.DEFAULT_BRANCH}}
+          git pull origin {{.DEFAULT_BRANCH}}
+      - task: sync:etc
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+      - task: sync:src
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+      - task: build
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+      - task: restart
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .ALL_SERVER_NAMES }}"
+
+  sync:src:
+    desc: サーバ上にソースコードを配置します
+    internal: true
+    dir: ./scripts
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          $ssht "git fetch origin"
+          $ssht "git switch {{.GIT_BRANCH}}"
+          $ssht "git pull origin {{.GIT_BRANCH}}"
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .ALL_SERVER_NAMES }}"
+      GIT_BRANCH:
+        sh: git branch --show-current
+
+  sync:etc:
+    desc: 設定ファイルをサーバに配置します
+    internal: true
+    dir: ./scripts
+    cmds:
+      - cmd: ./isuconf push --server-names {{.SERVER_NAME}}
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .ALL_SERVER_NAMES }}"
+
+  push:app:
+    desc: "アプリケーションのみをビルド・再起動します"
+    cmds:
+      - cmd: |
+          SERVER_NAME="{{.SERVER_NAMES}}"
+          if [ -z "$SERVER_NAME" ]; then
+            exit 1
+          fi
+      - task: sync:src
+        vars:
+          SERVER_NAME: "{{.SERVER_NAMES}}"
+      - task: build
+        vars:
+          SERVER_NAME: "{{.SERVER_NAMES}}"
+      - task: restart:app
+        vars:
+          SERVER_NAME: "{{.SERVER_NAMES}}"
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES }}"
+
+  pull:
+    desc: "isuconfを使用してサーバ上にある設定ファイルを取得します(引数でファイル名を指定可能)"
+    dir: ./scripts
+    cmds:
+      - ./isuconf pull {{.CLI_ARGS}}
+
+  build:
+    desc: "アプリケーションをビルドします"
+    internal: true
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          if echo {{.DEPLOY_APP_SERVER_NAMES}} | grep -qw "\b{{.SERVER_NAME}}\b"; then
+            ssht="ssh -t {{.SERVER_NAME}}"
+            $ssht "cd {{.APP_SRC_DIR}} && {{.APP_BUILD_CMD}}"
+          else
+            echo "Skip build app on {{.SERVER_NAME}}"
+          fi
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .DEPLOY_APP_SERVER_NAMES }}"
+
+  restart:
+    desc: "サービスを再起動します"
+    cmds:
+      - task: restart:nginx
+      - task: restart:mysql
+      - task: restart:app
+
+  restart:app:
+    desc: "アプリケーションを再起動します(サーバ指定なしの場合、全サーバが対象)"
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          if echo {{.DEPLOY_APP_SERVER_NAMES}} | grep -qw "\b{{.SERVER_NAME}}\b"; then
+            ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
+            $ssht "sudo systemctl daemon-reload"
+            $ssht "sudo systemctl restart {{.APP_SERVICE_NAME}}"
+          else
+            echo "Skip restart nginx on {{.APP_SERVICE_NAME}}"
+          fi
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .DEPLOY_APP_SERVER_NAMES }}"
+
+  restart:nginx:
+    desc: "nginxを再起動します(サーバ指定なしの場合、全サーバが対象)"
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          if echo {{.DEPLOY_NGINX_SERVER_NAMES}} | grep -qw "\b{{.SERVER_NAME}}\b"; then
+            ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
+            $ssht "sudo systemctl daemon-reload"
+            $ssht "sudo systemctl restart {{.NGINX_SERVICE_NAME}}"
+          else
+            echo "Skip restart nginx on {{.SERVER_NAME}}"
+          fi
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .DEPLOY_NGINX_SERVER_NAMES }}"
+
+  restart:mysql:
+    desc: "mysqlを再起動します(サーバ指定なしの場合、全サーバが対象)"
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          if echo {{.DEPLOY_MYSQL_SERVER_NAMES}} | grep -qw "\b{{.SERVER_NAME}}\b"; then
+            ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
+            $ssht "sudo systemctl daemon-reload"
+            $ssht "sudo systemctl restart {{.MYSQL_SERVICE_NAME}}"
+          else
+            echo "Skip restart mysql on {{.SERVER_NAME}}"
+          fi
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .DEPLOY_MYSQL_SERVER_NAMES }}"
+
+  log:nginx:
+    desc: "nginxのログを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo SYSTEMD_LESS=FRXMK journalctl -u {{.NGINX_SERVICE_NAME}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  logf:nginx:
+    desc: "nginxのログを表示します(追記分も続けて表示)"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo journalctl -u {{.NGINX_SERVICE_NAME}} -f"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:access:
+    desc: "アクセスログを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo less {{.ACCESS_LOG_FILE}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  logf:access:
+    desc: "アクセスログを表示します(追記分も続けて表示)"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo tail -f {{.ACCESS_LOG_FILE}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:slow:
+    desc: "スロークエリログを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo tail -f {{.SLOW_QUERY_LOG_FILE}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  logf:slow:
+    desc: "スロークエリログを表示します(追記分も続けて表示)"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo tail -f {{.SLOW_QUERY_LOG_FILE}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:mysql:
+    desc: "mysqlのログを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo SYSTEMD_LESS=FRXMK journalctl -u {{.MYSQL_SERVICE_NAME}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  logf:mysql:
+    desc: "mysqlのログを表示します(追記分も続けて表示)"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo journalctl -u {{.MYSQL_SERVICE_NAME}} -f"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:app:
+    desc: "アプリケーションのログを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo SYSTEMD_LESS=FRXMK journalctl -u {{.APP_SERVICE_NAME}}"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  logf:app:
+    desc: "アプリケーションのログを表示します(追記分も続けて表示)"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "sudo journalctl -u {{.APP_SERVICE_NAME}} -f"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:git:
+    desc: "サーバ上のgitログを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht 'echo $LANG'
+          $ssht "LESSCHARSET=utf-8 git log"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:htop:
+    desc: "htopを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "htop"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  log:dstat:
+    desc: "dstatを表示します"
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "dstat"
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  mysql:
+    desc: "mysqlに接続します"
+    interactive: true
+    cmds:
+      - cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          {{if eq .SERVER_NAME ""}}
+            read -p "Enter Server name: "
+            ssht="ssh -t $REPLY"
+          {{end}}
+          $ssht "mysql -u {{.MYSQL_USER_NAME}} -p{{.MYSQL_USER_PASSWORD}}" {{.MYSQL_DATABASE_NAME}}
+    vars:
+      SERVER_NAME: "{{ .CLI_ARGS }}"
+
+  bench:
+    desc: "ベンチマーク実行前に実行します。(pproteinを使用している場合は使用しない)"
+    cmds:
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssht="ssh -t {{ .SERVER_NAME }}"
+          $ssht "sudo chmod o+x /var/log/mysql"
+          for log_file in {{.TRUNCATE_LOG_FILE}}; do
+            $ssht "sudo chmod o+rw $log_file"
+            $ssht "truncate -s 0 $log_file"
+          done
+
+  summary:log:
+    desc: "ログを集計し、結果をGitHub Issueに記載します(pproteinを使用してない場合で、ベンチマーク実行後に使用)"
+    cmds:
+      - for: { var: ALL_SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          issue_body="## スコア${LR}"
+          issue_body+="\`\`\`${LR}"
+          issue_body+="ベンチマーク結果をここに貼り付けてください${LR}"
+
+          for server_name in {{.ALL_SERVER_NAMES}}; do
+            ssh="ssh -t $server_name"
+            alp_result=$($ssh "sudo cat {{.ACCESS_LOG_FILE}} | alp ltsv --config /home/isucon/scripts/alp.yml" 2>/dev/null)
+            
+            # pt-query-digestを使用して分析・結果を集計
+            # 一時的にファイルに保存
+            $ssh "sudo pt-query-digest {{.SLOW_QUERY_LOG_FILE}} > /tmp/slow_query.log"
+
+            # 行数が多いとIssueの文字数制限に引っかかるため、一部のみ表示
+            slow_query_result=$($ssh "head -n 200 /tmp/slow_query.log" 2>/dev/null)
+
+            issue_body+="\`\`\`${LR}"
+            issue_body+="## alp実行結果($server_name)${LR}"
+            issue_body+="$alp_result${LR}"
+            issue_body+="## slow query($server_name)${LR}"
+            issue_body+="\`\`\`${LR}"
+            issue_body+="$slow_query_result${LR}"
+            issue_body+="\`\`\`${LR}"
+          done
+          gh issue create -t "計測結果 スコア: 点 $(date '+%Y-%m-%d %H:%M:%S')" -b "$issue_body"
+    env:
+      LR: "\n"
+
+  summary:log:alp:
+    desc: "alpの結果を集計し標準出力に出力します(alp.ymlの設定調整用に使用)"
+    cmds:
+      - cmd: |
+          ssh="ssh -t {{.SERVER_NAME}}"
+          $ssh "sudo cat {{.ACCESS_LOG_FILE}} | alp ltsv --config /home/isucon/scripts/alp.yml"
+    vars:
+      SERVER_NAME: isu0
+
+  doc:tbls:
+    desc: "tblsでER図を生成します"
+    dir: ./
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          ssht="ssh -t {{.SERVER_NAME}}"
+          $ssht TBLS_DSN={{.MYSQL_DNS}} TBLS_DOC_PATH=/tmp/doc_tbls tbls doc -f -t mermaid
+          scp -r {{.SERVER_NAME}}:/tmp/doc_tbls ./docs/{{.SERVER_NAME}}
+          $ssht rm -rf /tmp/doc_tbls
+    vars:
+      MYSQL_DNS: "mysql://{{.MYSQL_USER_NAME}}:{{.MYSQL_USER_PASSWORD}}@localhost:3306/{{.MYSQL_DATABASE_NAME}}"
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .DEPLOY_MYSQL_SERVER_NAMES }}"
+
+  doc:isucrud:
+    desc: "isucrudでソースコードとDBの関係図を生成します"
+    dir: "{{.TASKFILE_DIR}}{{.LOCAL_APP_SRC_DIR}}"
+    cmds:
+      - cmd: "{{.TASKFILE_DIR}}/scripts/isucrud -web -dst {{.TASKFILE_DIR}}/docs/isucrud.md ./..."
+    vars:
+      LOCAL_APP_SRC_DIR:
+        ref: trimPrefix "/home/isucon" .APP_SRC_DIR
