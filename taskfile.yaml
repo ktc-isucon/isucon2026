@@ -5,13 +5,15 @@ vars:
   SERVER_ADDRESSES: "43.206.58.249 54.250.152.26 57.181.117.106 52.69.33.235"
   USER_NAME: isucon
 
-  APP_SERVICE_NAME: isu-go.service
-  APP_SRC_DIR: private_isu/webapp/golang
-  DEPLOY_APP_SERVER_NAMES: "isu0 isu1 isu2 isu3"
-  APP_BUILD_CMD: "make"
+  APP_SERVICE_NAME: isureal-go.service
+  APP_SRC_DIR: /home/isucon/webapp/go
+  DEPLOY_APP_SERVER_NAMES: "isu0 isu1 isu2"
+  # 非対話のsshではPATHに入らないため、サーバ同梱のGo(go.modのバージョン)を明示する
+  SERVER_GO_BIN_DIR: /home/isucon/local/go/bin
+  APP_BUILD_CMD: "env PATH={{.SERVER_GO_BIN_DIR}}:/usr/local/bin:/usr/bin:/bin make"
 
   NGINX_SERVICE_NAME: nginx.service
-  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2 isu3"
+  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2"
 
   MYSQL_SERVICE_NAME: mysql.service
   MYSQL_USER_NAME: isuconp
@@ -23,7 +25,10 @@ vars:
   SLOW_QUERY_LOG_FILE: "/var/log/mysql/mysql-slow.log"
   TRUNCATE_LOG_FILE: "{{.ACCESS_LOG_FILE}} {{.SLOW_QUERY_LOG_FILE}}"
   PG_SERVER_NAME: isu3
+  PG_SERVICE_NAME: postgresql.service
   PG_SLOW_QUERY_LOG_FILE: "/var/log/postgresql/postgresql-slow.json"
+  # PG_SERVER_NAMEで動かすpprotein関連のサービス
+  PPROTEIN_SERVICE_NAMES: "pg2slowlog.service pprotein-agent.service"
 
   SSH_REPOSITORY_URL: "ssh://github.com/{{ .REPOSITORY_NAME }}.git"
   ALL_SERVER_NAMES:
@@ -246,7 +251,7 @@ tasks:
           fi
       - task: sync:etc
         vars:
-          SERVER_NAME: "{{.SERVER_NAMES}}"
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
       - task: push:app
         vars:
           SERVER_NAMES: "{{.SERVER_NAMES}}"
@@ -304,7 +309,7 @@ tasks:
     internal: true
     dir: ./scripts
     cmds:
-      - cmd: ./isuconf push --server-names {{.SERVER_NAME}}
+      - cmd: ./isuconf push --server-names {{.SERVER_NAMES}}
     vars:
       SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .ALL_SERVER_NAMES }}"
 
@@ -318,13 +323,13 @@ tasks:
           fi
       - task: sync:src
         vars:
-          SERVER_NAME: "{{.SERVER_NAMES}}"
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
       - task: build
         vars:
-          SERVER_NAME: "{{.SERVER_NAMES}}"
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
       - task: restart:app
         vars:
-          SERVER_NAME: "{{.SERVER_NAMES}}"
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
     vars:
       SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES }}"
 
@@ -353,8 +358,19 @@ tasks:
     desc: "サービスを再起動します"
     cmds:
       - task: restart:nginx
-      - task: restart:mysql
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+      - task: restart:postgresql
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+      - task: restart:pprotein
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
       - task: restart:app
+        vars:
+          SERVER_NAMES: "{{.SERVER_NAMES}}"
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .ALL_SERVER_NAMES }}"
 
   restart:app:
     desc: "アプリケーションを再起動します(サーバ指定なしの場合、全サーバが対象)"
@@ -385,6 +401,39 @@ tasks:
           fi
     vars:
       SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .DEPLOY_NGINX_SERVER_NAMES }}"
+
+  restart:postgresql:
+    desc: "PostgreSQLを再起動します(DBサーバのみ対象)"
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          if [ "{{.SERVER_NAME}}" = "{{.PG_SERVER_NAME}}" ]; then
+            ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
+            $ssht "sudo systemctl daemon-reload"
+            $ssht "sudo systemctl restart {{.PG_SERVICE_NAME}}"
+            $ssht "sudo -u postgres psql -d isureal -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'"
+          else
+            echo "Skip restart postgresql on {{.SERVER_NAME}}"
+          fi
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .PG_SERVER_NAME }}"
+
+  restart:pprotein:
+    desc: "DBサーバのpg2slowlogとpprotein-agentを(必要ならインストールして)起動します"
+    cmds:
+      - for: { var: SERVER_NAMES, as: SERVER_NAME }
+        cmd: |
+          if [ "{{.SERVER_NAME}}" = "{{.PG_SERVER_NAME}}" ]; then
+            ssht="ssh -t {{.USER_NAME}}@{{.SERVER_NAME}}"
+            $ssht "test -x /home/isucon/go/bin/pprotein-agent || {{.SERVER_GO_BIN_DIR}}/go install github.com/kaz/pprotein/cli/pprotein-agent@latest"
+            $ssht "sudo systemctl daemon-reload"
+            $ssht "sudo systemctl enable {{.PPROTEIN_SERVICE_NAMES}}"
+            $ssht "sudo systemctl restart {{.PPROTEIN_SERVICE_NAMES}}"
+          else
+            echo "Skip restart pprotein on {{.SERVER_NAME}}"
+          fi
+    vars:
+      SERVER_NAMES: "{{ .CLI_ARGS | default .SERVER_NAMES | default .PG_SERVER_NAME }}"
 
   restart:mysql:
     desc: "mysqlを再起動します(サーバ指定なしの場合、全サーバが対象)"
