@@ -9,13 +9,13 @@ local:
 targets:
   - path: /etc/nginx/nginx.conf
     sudo: true
-  - path: /etc/nginx/sites-enabled/isucon.conf
+  - path: /etc/nginx/sites-enabled/isureal.conf
     sudo: true
   - path: /etc/mysql
     sudo: true
-  - path: /etc/systemd/system/isu-go.service
+  - path: /etc/systemd/system/isureal-go.service
     sudo: true
-  - path: /usr/lib/systemd/system/mysql.service
+  - path: /usr/lib/systemd/system/postgresql.service
     sudo: true
   - path: /usr/lib/systemd/system/nginx.service
     sudo: true

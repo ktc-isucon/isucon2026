@@ -1,22 +1,22 @@
 version: "3"
 vars:
-  REPOSITORY_NAME: ktc-isucon/isucon-template
+  REPOSITORY_NAME: ktc-isucon/isucon2026
   DEFAULT_BRANCH: main
-  SERVER_ADDRESSES: "localhost localhost localhost"
+  SERVER_ADDRESSES: "43.206.58.249 54.250.152.26 57.181.117.106 52.69.33.235"
   USER_NAME: isucon
 
   APP_SERVICE_NAME: isu-go.service
   APP_SRC_DIR: private_isu/webapp/golang
-  DEPLOY_APP_SERVER_NAMES: "isu0 isu1 isu2"
+  DEPLOY_APP_SERVER_NAMES: "isu0 isu1 isu2 isu3"
   APP_BUILD_CMD: "make"
 
   NGINX_SERVICE_NAME: nginx.service
-  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2"
+  DEPLOY_NGINX_SERVER_NAMES: "isu0 isu1 isu2 isu3"
 
   MYSQL_SERVICE_NAME: mysql.service
   MYSQL_USER_NAME: isuconp
   MYSQL_USER_PASSWORD: isuconp
-  DEPLOY_MYSQL_SERVER_NAMES: "isu0 isu1 isu2"
+  DEPLOY_MYSQL_SERVER_NAMES: "isu0 isu1 isu2 isu3"
   MYSQL_DATABASE_NAME: isupipe
 
   ACCESS_LOG_FILE: "/var/log/nginx/access.log"
